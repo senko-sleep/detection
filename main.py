@@ -1,4 +1,3 @@
-#stuff
 import os
 import cv2 as cv
 import numpy as np
@@ -152,13 +151,13 @@ class PokemonPredictor:
      """Process a single frame/image for prediction."""
      # Convert the image to grayscale
      gray_img = cv.cvtColor(img_np, cv.COLOR_BGR2GRAY)
-
+    
      # Apply Gaussian blur to reduce noise
      blurred_img = cv.GaussianBlur(gray_img, (5, 5), 0)
-
+    
      # Apply Canny edge detection to get outlines
      edged_img = cv.Canny(blurred_img, 50, 150)
-
+    
      # Find contours in the edged image
      contours, _ = cv.findContours(edged_img, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
 
@@ -176,17 +175,9 @@ class PokemonPredictor:
             # Process each large contour
             for i in range(min(5, len(large_contours))):  # Process top 5 large contours
                 largest_contour = large_contours[i]
-
-                # Calculate the mean color inside the contour
-                mask = np.zeros(gray_img.shape, dtype=np.uint8)
-                cv.drawContours(mask, [largest_contour], -1, 255, thickness=cv.FILLED)
-                mean_val = cv.mean(img_np, mask=mask)  # Get the average color of the contour area
-
-                # Choose a contrasting outline color based on the mean color
-                outline_color = (0, 255, 0) if mean_val[1] < 128 else (255, 0, 0)  # Green for darker areas, red for lighter
-
+                
                 # Draw the contour outlines
-                cv.drawContours(img_np, large_contours, i, outline_color, 2)  # Dynamic outline color
+                cv.drawContours(img_np, large_contours, i, (0, 255, 0), 2)  # Green outline
 
                 # Get bounding box for the largest contour
                 x, y, w, h = cv.boundingRect(largest_contour)
@@ -195,7 +186,7 @@ class PokemonPredictor:
                 # Convert ROI to grayscale for feature detection
                 gray_roi = cv.cvtColor(roi, cv.COLOR_BGR2GRAY)
                 _, desB = self.orb.detectAndCompute(gray_roi, None)
-
+                
                 # Perform cross-matching with the existing features
                 best_match_frame, accuracy = await self.cross_match(desB)
 
@@ -214,15 +205,16 @@ class PokemonPredictor:
             # Apply a color map to the heat map
             heat_map_color = cv.applyColorMap(heat_map, cv.COLORMAP_JET)
 
-            # Blend the original image with the heat map, preserving the original color
-            blended = cv.addWeighted(img_np, 0.8, heat_map_color, 0.2, 0)
+            # Blend the original image with the heat map
+            blended = cv.addWeighted(img_np, 0.7, heat_map_color, 0.3, 0)
 
             # Show the processed frame
             cv.imshow("Processed Frame with Heat Map", blended)
             cv.waitKey(1)  # Non-blocking wait
 
      return highest_score, best_match
-
+    
+    
     async def cross_match(self, desB):
         """Match the descriptors with the dataset using FLANN."""
         if desB is None or desB.size == 0:
@@ -288,3 +280,9 @@ async def main():
 # Run the main function
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+
+
+
+
