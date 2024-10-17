@@ -164,7 +164,7 @@ class PokemonPredictor:
 
             # Use tqdm to track progress
             for frame_idx, img_np in tqdm(enumerate(preloaded_frames), total=frame_count, desc="Processing frames"):
-                img_np = cv.cvtColor(img_np, cv.COLOR_RGB2BGR)  # Convert to BGR for OpenCV
+                img_np = cv.cvtColor(img_np, cv.IMREAD_COLOR)  # Convert to BGR for OpenCV
                 highest_score, best_match, processed_frame = await self.process_frame(img_np, frame_idx, highest_score, best_match)
                 frames_with_detections.append(processed_frame)  # Store the processed frame with detections
 
@@ -180,10 +180,11 @@ class PokemonPredictor:
     async def process_frame(self, img_np, frame_idx, highest_score, best_match):
         """Process a single frame/image for prediction."""
         # Convert the image to grayscale
-        gray_img = cv.cvtColor(img_np, cv.COLOR_BGR2GRAY)
+        #gray_img = cv.cvtColor(img_np, cv.COLOR_BGR2GRAY)
+
     
         # Apply Gaussian blur to reduce noise
-        blurred_img = cv.GaussianBlur(gray_img, (5, 5), 0)
+        blurred_img = cv.GaussianBlur(img_np, (5, 5), 0)
     
         # Apply Canny edge detection to get outlines
         edged_img = cv.Canny(blurred_img, 50, 150)
