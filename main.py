@@ -1,136 +1,144 @@
 import os
 import logging
 import requests
-import numpy as np
-import torch
-import torchvision.transforms as transforms
-from torchvision import models
-from PIL import Image
 from io import BytesIO
+from PIL import Image
+import torch
 from tqdm import tqdm
-from sklearn.metrics.pairwise import cosine_similarity
+import torchvision.transforms as transforms
+from torch.utils.data import Dataset, DataLoader
+import gc
+import yaml
 
-# Configuration class
-class Config:
-    ORG_DIR = 'pokemon_templates/train/images'
-    BATCH_SIZE = 16
-    EPOCHS = 5  # Increased for better training
-    INITIAL_LEARNING_RATE = 0.01
-    MODEL_SAVE_PATH = 'pokemon_detector.pth'
-    FEATURE_VECTOR_SIZE = 2048  # ResNet50 final feature layer
-
-# Dataset class
-class PokemonDataset:
-    def __init__(self, org_dir, transform=None):
-        self.org_dir = org_dir
+class PokemonDataset(Dataset):
+    def __init__(self, root_dir, transform=None):
+        self.root_dir = root_dir
         self.transform = transform
-        self.images = self.load_images()
-        self.model = self.load_resnet()  # Ensure model is loaded here
-        self.feature_vectors = self.load_feature_vectors()
+        self.images = []
+        self.labels = []
 
-    def load_images(self):
-        """Load image filenames from the given directory."""
-        return [img for img in os.listdir(self.org_dir) if img.endswith(".png")]
+        for img_file in os.listdir(root_dir):
+            if img_file.endswith('.png'):
+                img_path = os.path.join(root_dir, img_file)
+                label_path = img_path.replace('images', 'labels').replace('.png', '.txt')
+                self.images.append(img_path)
+                self.labels.append(label_path)
 
-    def load_resnet(self):
-        """Load pretrained ResNet50 for feature extraction."""
-        model = models.resnet50(weights='IMAGENET1K_V1')
-        model.fc = torch.nn.Identity()  # Use penultimate layer for feature vectors
-        model.eval()
-        return model
+    def __len__(self):
+        return len(self.images)
 
-    def extract_features(self, image):
-        """Extract feature vector from an image using ResNet50."""
-        with torch.no_grad():
-            features = self.model(image)
-        return features
+    def __getitem__(self, idx):
+        img_path = self.images[idx]
+        label_path = self.labels[idx]
 
-    def load_feature_vectors(self):
-        """Precompute feature vectors for all Pokémon templates, including flipped versions."""
-        features = {}
-        for img_name in tqdm(self.images, desc="Extracting features"):
-            img_path = os.path.join(self.org_dir, img_name)
+        image = Image.open(img_path).convert('RGB')
 
-            # Load original image and convert to tensor
-            image = Image.open(img_path).convert('RGB')
-            if self.transform:
-                image_tensor = self.transform(image).unsqueeze(0)
+        if self.transform:
+            image = self.transform(image)
 
-            # Store feature vector for the original image
-            features[img_name] = self.extract_features(image_tensor).cpu().numpy()
+        with open(label_path, 'r') as f:
+            boxes = [list(map(float, line.split())) for line in f]
 
-            # Store feature vector for the horizontally flipped image
-            flipped_image = image.transpose(Image.FLIP_LEFT_RIGHT)
-            flipped_tensor = self.transform(flipped_image).unsqueeze(0)
-            features[f"{img_name}_flipped"] = self.extract_features(flipped_tensor).cpu().numpy()
+        return image, torch.tensor(boxes)
 
-        return features
-
-# Main Detector class
 class PokemonDetector:
     def __init__(self):
+        self.pokemon_templates = os.path.join(os.getcwd(), 'pokemon_templates')
+        self.train_images_path = os.path.join(self.pokemon_templates, 'train', 'images')
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.dataset = PokemonDataset(Config.ORG_DIR, transform=self.initialize_transform())
-        self.model = self.dataset.load_resnet().to(self.device)
+        self.model_path = 'yolov5_pokemon_model.pt'
 
-    def initialize_transform(self):
-        """Define the transform pipeline."""
-        return transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        # Load YOLOv5 model from ultralytics or custom
+        self.model = self.load_or_train_model()
+
+        # Data transformation (resizing for YOLOv5 input)
+        self.transform = transforms.Compose([
+            transforms.Resize((640, 640)),
+            transforms.ToTensor()
         ])
 
+    def load_or_train_model(self):
+        """Load the YOLOv5 model or train it if no pretrained model exists."""
+        if os.path.exists(self.model_path):
+            logging.info(f"Loading model from {self.model_path}...")
+            model = torch.hub.load('ultralytics/yolov5', 'custom', path=self.model_path)
+        else:
+            logging.info("No saved model found. Training a new model...")
+            model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
+            self.train_model(model)
+            model.save(self.model_path)
+            logging.info(f"Model saved to {self.model_path}")
+        return model.to(self.device)
+
+    def train_model(self, model, epochs=5, batch_size=16):
+        """Train the YOLOv5 model."""
+        # Initialize dataset and dataloader
+        dataset = PokemonDataset(self.train_images_path, transform=self.transform)
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+        logging.info("Starting training...")
+
+        for epoch in range(epochs):
+            running_loss = 0.0
+            with tqdm(total=len(dataloader), desc=f"Epoch [{epoch + 1}/{epochs}]", unit="batch") as pbar:
+                for images, boxes in dataloader:
+                    images = images.to(self.device)
+                    boxes = boxes.to(self.device)
+
+                    optimizer = model.model.module.model[-1].optimizer
+
+                    # Forward pass
+                    outputs = model(images, targets=boxes)
+
+                    # Compute loss and update weights
+                    loss = outputs.loss
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+
+                    running_loss += loss.item()
+                    pbar.set_postfix(loss=running_loss / (pbar.n + 1))
+                    pbar.update(1)
+
+            logging.info(f"Epoch [{epoch + 1}/{epochs}], Loss: {running_loss / len(dataloader):.4f}")
+            gc.collect()
+
+        logging.info("Training completed.")
+
     def predict(self, image_url):
-        """Predict the closest matching Pokémon template from an input image URL."""
+        """Predict the bounding boxes and classes of Pokémon from an image URL."""
         try:
             response = requests.get(image_url)
             response.raise_for_status()
             image = Image.open(BytesIO(response.content)).convert('RGB')
-            image = self.initialize_transform()(image).unsqueeze(0).to(self.device)
-
-            # Extract feature vector from the input image
-            input_features = self.dataset.extract_features(image).cpu().numpy()
-
-            # Find the closest match by comparing with template feature vectors
-            best_match, best_score = self.find_best_match(input_features)
-            if best_score > 0.7:  # Confidence threshold
-                return best_match, best_score
-            else:
-                logging.warning("No confident match found.")
-                return None
-
         except Exception as e:
-            logging.error(f"Error in prediction: {e}")
+            logging.error(f"Failed to load image from URL: {e}")
             return None
 
-    def find_best_match(self, input_features):
-        """Find the Pokémon template with the highest cosine similarity, considering flipped images."""
-        best_match = None
-        best_score = -1
+        image = self.transform(image).unsqueeze(0).to(self.device)
 
-        for img_name, feature_vector in self.dataset.feature_vectors.items():
-            similarity = cosine_similarity(input_features, feature_vector)[0][0]
-            if similarity > best_score:
-                best_match = img_name.split('.')[0].replace('_flipped', '')  # Remove flipped marker if present
-                best_score = similarity
+        self.model.eval()
+        with torch.no_grad():
+            outputs = self.model(image)
 
-        return best_match, best_score
+        return outputs
 
-# Main Execution
+    def run(self):
+        """Run the prediction loop."""
+        while True:
+            img_url = input("Enter the URL to a Pokémon image (or type 'quit' to exit): ")
+            if img_url.lower() == 'quit':
+                logging.info("Exiting the Pokémon Detector.")
+                break
+
+            result = self.predict(img_url)
+            if result is not None:
+                logging.info(f"Predicted bounding boxes: {result.xyxy}")
+            else:
+                logging.info("Prediction failed.")
+
+
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     detector = PokemonDetector()
-
-    while True:
-        image_url = input("Enter the image URL for prediction (or type 'exit' to quit): ").strip()
-        if image_url.lower() == 'exit':
-            break
-
-        result = detector.predict(image_url)
-        if result:
-            prediction, confidence = result
-            logging.info(f"Matched Pokémon: {prediction} with confidence: {confidence:.2f}")
-        else:
-            logging.error("Prediction failed.")
+    detector.run()
