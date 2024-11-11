@@ -1,144 +1,278 @@
 import os
+import cv2 as cv
+import numpy as np
+import time
+import aiohttp
+import asyncio
+import io
+from sklearn.metrics.pairwise import cosine_similarity
 import logging
-import requests
-from io import BytesIO
-from PIL import Image
-import torch
-from tqdm import tqdm
-import torchvision.transforms as transforms
-from torch.utils.data import Dataset, DataLoader
-import gc
-import yaml
+from concurrent.futures import ThreadPoolExecutor
+from PIL import Image, ImageSequence
+from tqdm import tqdm  # Import tqdm for progress tracking
+import mediapipe as mp
 
-class PokemonDataset(Dataset):
-    def __init__(self, root_dir, transform=None):
-        self.root_dir = root_dir
-        self.transform = transform
-        self.images = []
-        self.labels = []
+# Configure logging
+logging.basicConfig(filename='pokemon_predictor.log', level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
 
-        for img_file in os.listdir(root_dir):
-            if img_file.endswith('.png'):
-                img_path = os.path.join(root_dir, img_file)
-                label_path = img_path.replace('images', 'labels').replace('.png', '.txt')
-                self.images.append(img_path)
-                self.labels.append(label_path)
 
-    def __len__(self):
-        return len(self.images)
+class PokemonPredictor:
+    def __init__(self, dataset_folder="Data/pokemon/pokemon_images", 
+                 dataset_file="dataset.npy", max_workers=4, num_keypoints=100):
+        self.flann = cv.FlannBasedMatcher(
+            dict(algorithm=6, table_number=9, key_size=9, multi_probe_level=1), 
+            dict(checks=1, fast=True)
+        )
+        self.cache = {}  # Store descriptors
+        self.dataset_file = dataset_file
+        self.dataset_folder = dataset_folder
+        self.orb = cv.ORB_create(nfeatures=num_keypoints)  # Initialize ORB detector
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
 
-    def __getitem__(self, idx):
-        img_path = self.images[idx]
-        label_path = self.labels[idx]
-
-        image = Image.open(img_path).convert('RGB')
-
-        if self.transform:
-            image = self.transform(image)
-
-        with open(label_path, 'r') as f:
-            boxes = [list(map(float, line.split())) for line in f]
-
-        return image, torch.tensor(boxes)
-
-class PokemonDetector:
-    def __init__(self):
-        self.pokemon_templates = os.path.join(os.getcwd(), 'pokemon_templates')
-        self.train_images_path = os.path.join(self.pokemon_templates, 'train', 'images')
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model_path = 'yolov5_pokemon_model.pt'
-
-        # Load YOLOv5 model from ultralytics or custom
-        self.model = self.load_or_train_model()
-
-        # Data transformation (resizing for YOLOv5 input)
-        self.transform = transforms.Compose([
-            transforms.Resize((640, 640)),
-            transforms.ToTensor()
-        ])
-
-    def load_or_train_model(self):
-        """Load the YOLOv5 model or train it if no pretrained model exists."""
-        if os.path.exists(self.model_path):
-            logging.info(f"Loading model from {self.model_path}...")
-            model = torch.hub.load('ultralytics/yolov5', 'custom', path=self.model_path)
+    async def load_dataset(self):
+        """Load the dataset from npy file or process the image folder asynchronously."""
+        if os.path.exists(self.dataset_file):
+            self.load_from_npy(self.dataset_file)
         else:
-            logging.info("No saved model found. Training a new model...")
-            model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
-            self.train_model(model)
-            model.save(self.model_path)
-            logging.info(f"Model saved to {self.model_path}")
-        return model.to(self.device)
+            await self.load_from_images()
 
-    def train_model(self, model, epochs=5, batch_size=16):
-        """Train the YOLOv5 model."""
-        # Initialize dataset and dataloader
-        dataset = PokemonDataset(self.train_images_path, transform=self.transform)
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    def load_from_npy(self, dataset_file):
+        """Load precomputed descriptors from npy."""
+        data = np.load(dataset_file, allow_pickle=True).item()
+        self.cache = data
+        logging.info(f"Loaded dataset from {dataset_file}. Total images: {len(data)}")
 
-        logging.info("Starting training...")
+    async def load_from_images(self):
+        """Process images in the folder using asyncio."""
+        tasks = [
+            self.process_image(os.path.join(self.dataset_folder, filename), filename)
+            for filename in os.listdir(self.dataset_folder)
+            if os.path.isfile(os.path.join(self.dataset_folder, filename))
+        ]
+        await asyncio.gather(*tasks)  # Gather all tasks and run them concurrently
+        await self.save_dataset_concurrently()
 
-        for epoch in range(epochs):
-            running_loss = 0.0
-            with tqdm(total=len(dataloader), desc=f"Epoch [{epoch + 1}/{epochs}]", unit="batch") as pbar:
-                for images, boxes in dataloader:
-                    images = images.to(self.device)
-                    boxes = boxes.to(self.device)
+    async def save_dataset_concurrently(self):
+        """Save the dataset to npy file asynchronously."""
+        if self.cache:  # Only save if there are descriptors
+            try:
+                await asyncio.to_thread(self.save_to_npy)
+            except Exception as e:
+                logging.error(f"Error saving dataset: {e}")
+        else:
+            logging.info("No descriptors to save.")
 
-                    optimizer = model.model.module.model[-1].optimizer
+    def save_to_npy(self):
+        """Actual function to save the cache to a npy file."""
+        np.save(self.dataset_file, self.cache)
+        logging.info(f"Saved dataset to {self.dataset_file}.")
 
-                    # Forward pass
-                    outputs = model(images, targets=boxes)
+    async def process_image(self, path, filename):
+        """Process a single image asynchronously."""
+        img = await asyncio.get_event_loop().run_in_executor(self.executor, cv.imread, path)
+        if img is not None:
+            gray_img = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
+            keypoints, descriptors = self.orb.detectAndCompute(gray_img, None)
+            if descriptors is not None:
+                self.cache[filename] = descriptors.astype(np.uint8)
+                await self.cache_flipped_image(img, filename)
 
-                    # Compute loss and update weights
-                    loss = outputs.loss
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
+    async def cache_flipped_image(self, img, filename):
+        """Cache the flipped version of the image and its descriptors."""
+        flipped_img = cv.flip(img, 1)
+        gray_flipped_img = cv.cvtColor(flipped_img, cv.COLOR_BGR2GRAY)
+        keypoints, descriptors = self.orb.detectAndCompute(gray_flipped_img, None)
+        if descriptors is not None:
+            flipped_filename = filename.replace(".png", "_flipped.png")
+            self.cache[flipped_filename] = descriptors.astype(np.uint8)
 
-                    running_loss += loss.item()
-                    pbar.set_postfix(loss=running_loss / (pbar.n + 1))
-                    pbar.update(1)
+    async def load_image_from_url(self, url):
+        """Asynchronously fetch and decode an image from a URL."""
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.get(url) as response:
+                    if response.status == 200:
+                        img_data = await response.read()
+                        img_array = np.asarray(bytearray(img_data), dtype=np.uint8)
+                        return cv.imdecode(img_array, cv.IMREAD_COLOR)
+                    else:
+                        logging.error(f"Failed to fetch image, status code: {response.status}")
+            except aiohttp.ClientError as e:
+                logging.error(f"Error fetching image: {e}")
+        return None
 
-            logging.info(f"Epoch [{epoch + 1}/{epochs}], Loss: {running_loss / len(dataloader):.4f}")
-            gc.collect()
+    async def load_gif_frames(self, url):
+     """Load frames from a GIF URL and capture their durations."""
+     async with aiohttp.ClientSession() as session:
+         try:
+            async with session.get(url) as response:
+                if response.status == 200:
+                    img_data = await response.read()
+                    img_gif = Image.open(io.BytesIO(img_data))
+                    frames = [np.array(frame.convert('RGB')) for frame in ImageSequence.Iterator(img_gif)]
+                    
+                    # Extract durations (in milliseconds) for each frame
+                    durations = [frame.info['duration'] for frame in ImageSequence.Iterator(img_gif)]
+                    return frames, durations
+                else:
+                    logging.error(f"Failed to fetch GIF, status code: {response.status}")
+         except aiohttp.ClientError as e:
+            logging.error(f"Error fetching GIF: {e}")
+     return None, None
 
-        logging.info("Training completed.")
+    async def cross_match(self, desB):
+        """Match the descriptors with the dataset using FLANN."""
+        if desB is None or desB.size == 0:
+            logging.warning("No descriptors available for matching.")
+            return None, 0.0
 
-    def predict(self, image_url):
-        """Predict the bounding boxes and classes of Pokémon from an image URL."""
-        try:
-            response = requests.get(image_url)
-            response.raise_for_status()
-            image = Image.open(BytesIO(response.content)).convert('RGB')
-        except Exception as e:
-            logging.error(f"Failed to load image from URL: {e}")
-            return None
+        best_match = None
+        best_score = float('-inf')
 
-        image = self.transform(image).unsqueeze(0).to(self.device)
+        for filename, descriptor in self.cache.items():
+            matches = self.flann.knnMatch(desB, descriptor, k=2)
 
-        self.model.eval()
-        with torch.no_grad():
-            outputs = self.model(image)
+            # Filter out good matches
+            good_matches = []
+            for match_pair in matches:
+                # Ensure we have at least 2 matches in the pair
+                if len(match_pair) >= 2:
+                    m, n = match_pair  # Unpack the matches
+                    # Compare distances and filter matches
+                    if m.distance < 0.75 * n.distance:
+                        good_matches.append(m)
 
-        return outputs
+            score = len(good_matches)
 
-    def run(self):
-        """Run the prediction loop."""
-        while True:
-            img_url = input("Enter the URL to a Pokémon image (or type 'quit' to exit): ")
-            if img_url.lower() == 'quit':
-                logging.info("Exiting the Pokémon Detector.")
-                break
+            if score > best_score:
+                best_score = score
+                best_match = filename
 
-            result = self.predict(img_url)
-            if result is not None:
-                logging.info(f"Predicted bounding boxes: {result.xyxy}")
-            else:
-                logging.info("Prediction failed.")
+        return best_match, best_score
 
+    async def predict_pokemon(self, img):
+     """Predict the closest matching Pokémon from the dataset using contour detection and feature extraction."""
+     start_time = time.time()
+     best_match = None
+     highest_score = float('-inf')  # Initialize with very low similarity score
+     frames_with_detections = []  # List to store frames with bounding boxes
+     durations = []  # List to store frame durations (for GIFs)
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-    detector = PokemonDetector()
-    detector.run()
+     # Process as a list of frames (animated GIF) or as a static image
+     if isinstance(img, list):
+        preloaded_frames = img.copy()
+        frame_count = len(preloaded_frames)
+
+        # Use tqdm to track progress
+        for frame_idx, img_np in tqdm(enumerate(preloaded_frames), total=frame_count, desc="Processing frames"):
+            img_np = cv.cvtColor(img_np, cv.IMREAD_COLOR)  # Convert to BGR for OpenCV
+            highest_score, best_match, processed_frame = await self.process_frame(img_np, frame_idx, highest_score, best_match)
+            frames_with_detections.append(processed_frame)  # Store the processed frame with detections
+
+        # Return both frames and durations if it's a GIF
+        return best_match, time.time() - start_time, frames_with_detections, durations
+
+     else:
+        img_np = np.array(img)
+        img_np = img_np.astype(np.uint8) if img_np.dtype != np.uint8 else img_np
+        highest_score, best_match, processed_frame = await self.process_frame(img_np, 0, highest_score, best_match)
+        frames_with_detections.append(processed_frame)  # Store the processed frame with detections
+
+     logging.info(f"Processed image in {time.time() - start_time:.2f} seconds. Best match: {best_match} with score {highest_score}.")
+     return best_match, time.time() - start_time, frames_with_detections, None  # No durations for static images
+    
+    
+    async def process_frame(self, img_np, frame_idx, highest_score, best_match):
+     """Process a single frame/image for prediction with enhanced edge detection."""
+    
+     # Apply Gaussian blur to reduce noise
+     blurred_img = cv.GaussianBlur(img_np, (5, 5), 0)
+    
+     # Apply Canny edge detection to get outlines, with tweaked thresholds for better detection
+     edged_img = cv.Canny(blurred_img, 50, 200)
+    
+     # Find contours in the edged image
+     contours, hierarchy = cv.findContours(edged_img, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+
+     # Create a blank image to draw the heat map
+     heat_map = np.zeros_like(img_np, dtype=np.float32)
+
+     if contours:
+        # Filter out small contours to focus on larger regions of interest
+        large_contours = [cnt for cnt in contours if cv.contourArea(cnt) > 500]  # Adjust area threshold as needed
+
+        if large_contours:
+            # Sort contours by area and take the largest ones
+            large_contours = sorted(large_contours, key=cv.contourArea, reverse=True)
+
+            # Process each large contour
+            for i in range(min(10, len(large_contours))):  # Limit to top 10 largest contours
+                cnt = large_contours[i]
+                x, y, w, h = cv.boundingRect(cnt)
+                roi = img_np[y:y + h, x:x + w]
+
+                # Convert ROI to grayscale for feature detection
+                gray_roi = cv.cvtColor(roi, cv.COLOR_BGR2GRAY)
+
+                # Detect keypoints and compute descriptors
+                kp_roi, des_roi = self.orb.detectAndCompute(gray_roi, None)
+                if des_roi is not None and des_roi.shape[0] > 0:
+                    # Compare with dataset
+                    for name, des in self.cache.items():
+                        if des.shape[0] > 0:
+                            # Compute cosine similarity
+                            similarity = cosine_similarity(des_roi.astype(np.float32), des.astype(np.float32))
+                            score = np.max(similarity)
+
+                            # Update the best match if the score is higher
+                            if score > highest_score:
+                                highest_score = score
+                                best_match = name
+
+                # Optional: Draw bounding box around detected object
+                cv.rectangle(img_np, (x, y), (x + w, y + h), (255, 0, 0), 2)  # Red bounding box
+
+                # Update the heat map with bounding box area
+                cv.rectangle(heat_map, (x, y), (x + w, y + h), (255, 255, 255), -1)  # White rectangle
+
+        # Optional: Draw contours over the image to visualize outlines
+        for cnt in large_contours:
+            cv.drawContours(img_np, [cnt], -1, (0, 255, 0), 2)  # Green contour lines
+
+     # Return the highest score, best match, and processed image
+     return highest_score, best_match, img_np  
+ 
+    async def save_gif_with_detections(self, frames, durations):
+     """Save the processed frames as a new GIF with bounding boxes, maintaining the original speed."""
+     save_path = 'detected_pokemon.gif'
+     frames_to_save = [Image.fromarray(frame) for frame in frames]
+    
+     # Save the frames with the original frame durations
+     frames_to_save[0].save(save_path, save_all=True, append_images=frames_to_save[1:], loop=0, duration=durations)
+     logging.info(f"Saved processed GIF with detections to {save_path}.")
+     
+async def main():
+    predictor = PokemonPredictor()
+    await predictor.load_dataset()
+
+    while True:
+        img_url = input("Enter an image URL (or type 'quit' to exit): ")
+        if img_url.lower() == 'quit':
+            break
+
+        # Load GIF or static image
+        if img_url.lower().endswith('.gif'):
+            frames, durations = await predictor.load_gif_frames(img_url)
+            if frames:
+                best_match, _, processed_frames, _ = await predictor.predict_pokemon(frames)
+                print(f"Best match for GIF: {best_match}")
+                await predictor.save_gif_with_detections(processed_frames, durations)
+
+        else:
+            img = await predictor.load_image_from_url(img_url)
+            if img is not None:
+                best_match, _, processed_frames, _ = await predictor.predict_pokemon(img)
+                print(f"Best match for image: {best_match}")
+
+asyncio.run(main())
