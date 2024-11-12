@@ -184,32 +184,45 @@ class PokemonPredictor:
     
     
     async def process_frame(self, img_np, frame_idx, highest_score, best_match):
-     """Process a single frame/image for prediction with enhanced edge detection."""
-    
-     # Apply Gaussian blur to reduce noise
+     """Process a single frame/image for prediction with stronger edge detection and adaptive bounding."""
+
+     # Apply Gaussian blur to reduce noise and enhance edges
      blurred_img = cv.GaussianBlur(img_np, (5, 5), 0)
     
-     # Apply Canny edge detection to get outlines, with tweaked thresholds for better detection
-     edged_img = cv.Canny(blurred_img, 50, 200)
+     # Apply adaptive thresholding for more consistent edge enhancement
+     gray_img = cv.cvtColor(blurred_img, cv.COLOR_BGR2GRAY)
+     adaptive_thresh = cv.adaptiveThreshold(gray_img, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                           cv.THRESH_BINARY_INV, 11, 2)
     
-     # Find contours in the edged image
-     contours, hierarchy = cv.findContours(edged_img, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+     # Apply Canny edge detection with fine-tuned thresholds
+     edged_img = cv.Canny(adaptive_thresh, 20, 120)
+    
+     # Dilate edges to connect broken lines and make contours more complete
+     dilated_img = cv.dilate(edged_img, None, iterations=2)
+    
+     # Find contours in the processed (dilated) edge image
+     contours, _ = cv.findContours(dilated_img, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
 
-     # Create a blank image to draw the heat map
+     # Create a blank image for the heat map
      heat_map = np.zeros_like(img_np, dtype=np.float32)
 
      if contours:
-        # Filter out small contours to focus on larger regions of interest
-        large_contours = [cnt for cnt in contours if cv.contourArea(cnt) > 500]  # Adjust area threshold as needed
+        # Reduce the contour area threshold for increased sensitivity
+        large_contours = [cnt for cnt in contours if cv.contourArea(cnt) > 300]  # Reduced threshold
 
         if large_contours:
-            # Sort contours by area and take the largest ones
-            large_contours = sorted(large_contours, key=cv.contourArea, reverse=True)
+            # Sort contours by area and keep the top largest contours
+            large_contours = sorted(large_contours, key=cv.contourArea, reverse=True)[:5]
 
-            # Process each large contour
-            for i in range(min(10, len(large_contours))):  # Limit to top 10 largest contours
-                cnt = large_contours[i]
+            for cnt in large_contours:
+                # Get bounding box and slightly expand it to ensure complete object capture
                 x, y, w, h = cv.boundingRect(cnt)
+                expansion_margin = 10  # Pixels to expand in each direction
+                x = max(0, x - expansion_margin)
+                y = max(0, y - expansion_margin)
+                w = min(img_np.shape[1] - x, w + 2 * expansion_margin)
+                h = min(img_np.shape[0] - y, h + 2 * expansion_margin)
+                
                 roi = img_np[y:y + h, x:x + w]
 
                 # Convert ROI to grayscale for feature detection
@@ -218,30 +231,29 @@ class PokemonPredictor:
                 # Detect keypoints and compute descriptors
                 kp_roi, des_roi = self.orb.detectAndCompute(gray_roi, None)
                 if des_roi is not None and des_roi.shape[0] > 0:
-                    # Compare with dataset
+                    # Compare with dataset using cosine similarity
                     for name, des in self.cache.items():
                         if des.shape[0] > 0:
-                            # Compute cosine similarity
                             similarity = cosine_similarity(des_roi.astype(np.float32), des.astype(np.float32))
                             score = np.max(similarity)
 
-                            # Update the best match if the score is higher
+                            # Update best match if score is higher
                             if score > highest_score:
                                 highest_score = score
                                 best_match = name
 
-                # Optional: Draw bounding box around detected object
+                # Draw expanded bounding box
                 cv.rectangle(img_np, (x, y), (x + w, y + h), (255, 0, 0), 2)  # Red bounding box
 
-                # Update the heat map with bounding box area
+                # Update the heat map with the bounding box area
                 cv.rectangle(heat_map, (x, y), (x + w, y + h), (255, 255, 255), -1)  # White rectangle
 
-        # Optional: Draw contours over the image to visualize outlines
+        # Draw contours for visualization
         for cnt in large_contours:
             cv.drawContours(img_np, [cnt], -1, (0, 255, 0), 2)  # Green contour lines
 
      # Return the highest score, best match, and processed image
-     return highest_score, best_match, img_np  
+     return highest_score, best_match, img_np
  
     async def save_gif_with_detections(self, frames, durations):
      """Save the processed frames as a new GIF with bounding boxes, maintaining the original speed."""
