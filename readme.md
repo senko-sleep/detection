@@ -2,7 +2,7 @@
 
 `ImagePredictor` is a Python-based application for identifying the closest matching image from a dataset. It uses advanced edge detection, feature matching, and asynchronous processing to handle both static images and animated GIFs, identifying objects based on a precomputed dataset of features.
 
-![Detected GIF](Testing/detected_pokemon.gif)
+![Detected GIF](Testing/images/detected.gif)
 
 ### Features:
 - **Async Loading**: Efficiently loads and caches image data with asynchronous processing.
@@ -14,7 +14,7 @@
 
 ### Detected Face GIF
 
-![Detected Face GIF](Testing/Testing/detected_face.gif)
+![Detected Face GIF](Testing/Testing/images/detected_face.gif)
 
 This GIF demonstrates the **face detection** functionality of the `ImagePredictor`. In the example, the application detects faces in animated GIFs frame by frame. Each frame is processed to identify the most prominent face using the `DNN-based face detector`. Once the face is detected, a bounding box is drawn around the face to clearly highlight the identified region. 
 
