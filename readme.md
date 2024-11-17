@@ -14,7 +14,7 @@
 
 ### Detected Face GIF
 
-![Detected Face GIF](Testing/Testing/images/detected_face.gif)
+![Detected Face GIF](Testing/images/detected_face.gif)
 
 This GIF demonstrates the **face detection** functionality of the `ImagePredictor`. In the example, the application detects faces in animated GIFs frame by frame. Each frame is processed to identify the most prominent face using the `DNN-based face detector`. Once the face is detected, a bounding box is drawn around the face to clearly highlight the identified region. 
 
