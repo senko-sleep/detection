@@ -204,58 +204,61 @@ class PokemonPredictor:
     
     
     async def process_frame(self, img_np, frame_idx, highest_score, best_match):
-     """Face detection with alignment-based evaluation (using matrix for feature analysis)."""
+     """Face detection with landmark refinement and tightly fitted bounding box."""
      try:
-        # Convert the image to grayscale for feature matching and face detection
-        gray_img = cv.cvtColor(img_np, cv.COLOR_BGR2GRAY)
+        # Convert the image to BGR for face detection
+        blob = cv.dnn.blobFromImage(img_np, 1.0, (300, 300), (104.0, 177.0, 123.0), swapRB=True, crop=False)
+        self.face_net.setInput(blob)
+        detections = self.face_net.forward()
 
-        # Initialize ORB detector for feature extraction
-        kp, des = self.orb.detectAndCompute(gray_img, None)
+        # Find the highest scoring detection
+        face_box = None
+        max_confidence = 0
 
-        if des is None or len(des) == 0:
-            return highest_score, best_match, img_np  # If no features detected, return original image
+        # Iterate over all detections to find the best face
+        for i in range(detections.shape[2]):
+            confidence = detections[0, 0, i, 2]
+            if confidence > max_confidence:
+                max_confidence = confidence
+                x1 = int(detections[0, 0, i, 3] * img_np.shape[1])
+                y1 = int(detections[0, 0, i, 4] * img_np.shape[0])
+                x2 = int(detections[0, 0, i, 5] * img_np.shape[1])
+                y2 = int(detections[0, 0, i, 6] * img_np.shape[0])
+                face_box = (x1, y1, x2, y2)
 
-        # Use a feature matching method based on ORB descriptors
-        best_match = None
-        highest_score = 0.0
+        # If a face was detected, process landmarks and refine the bounding box
+        if face_box:
+            # Draw the initial bounding box
+            x1, y1, x2, y2 = face_box
+            cv.rectangle(img_np, (x1, y1), (x2, y2), (255, 0, 0), 2)
+            cv.putText(img_np, 'Face', (x1, y1 - 10), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
 
-        # Process the cached feature descriptors for matching
-        for name, cached_des in self.cache.items():
-            if cached_des.shape[0] > 0:
-                similarity = cosine_similarity(des.astype(np.float32), cached_des.astype(np.float32))
-                score = np.max(similarity)
-                if score > highest_score:
-                    highest_score = score
-                    best_match = name
+            # Use the landmark detector to refine the face area
+            face_roi = img_np[y1:y2, x1:x2]
+            landmarks = self.landmark_detector.detectLandmarks(face_roi)
 
-        # Apply a matrix-based approach to detect aligned facial regions
-        # Here we calculate the transformation matrix that maps keypoints to regions with face-like features
-        matrix = np.eye(3)  # Identity matrix for simplicity in this initial version
+            if landmarks:
+                # Use the landmarks to refine the bounding box
+                # Assuming landmarks is a list of points like [(x1, y1), (x2, y2), ...]
+                min_x = min([pt[0] for pt in landmarks])
+                max_x = max([pt[0] for pt in landmarks])
+                min_y = min([pt[1] for pt in landmarks])
+                max_y = max([pt[1] for pt in landmarks])
 
-        # Define a region of interest based on the detected keypoints
-        min_x = min(kp, key=lambda k: k.pt[0]).pt[0] if kp else 0
-        min_y = min(kp, key=lambda k: k.pt[1]).pt[1] if kp else 0
-        max_x = max(kp, key=lambda k: k.pt[0]).pt[0] if kp else img_np.shape[1]
-        max_y = max(kp, key=lambda k: k.pt[1]).pt[1] if kp else img_np.shape[0]
+                # Adjust the bounding box to fit the landmarks more tightly
+                shrink_factor = 0.1  # Shrink the box slightly
+                x1 = max(0, int(min_x - (max_x - min_x) * shrink_factor))
+                y1 = max(0, int(min_y - (max_y - min_y) * shrink_factor))
+                x2 = min(img_np.shape[1], int(max_x + (max_x - min_x) * shrink_factor))
+                y2 = min(img_np.shape[0], int(max_y + (max_y - min_y) * shrink_factor))
 
-        # Define a bounding box that will contain the most likely facial region based on keypoint alignment
-        x, y, w, h = int(min_x), int(min_y), int(max_x - min_x), int(max_y - min_y)
+                # Draw the refined bounding box
+                cv.rectangle(img_np, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv.putText(img_np, 'Refined Face', (x1, y1 - 10), cv.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
 
-        # Create a mask to refine face-like areas
-        face_mask = np.zeros_like(gray_img, dtype=np.uint8)
-
-        # For each keypoint, highlight the region that seems most aligned with facial structure
-        for point in kp:
-            if 0 < point.pt[0] < img_np.shape[1] and 0 < point.pt[1] < img_np.shape[0]:
-                cv.circle(face_mask, (int(point.pt[0]), int(point.pt[1])), 3, 255, -1)
-
-        # Apply the mask to focus on face-like areas
-        face_roi = cv.bitwise_and(img_np, img_np, mask=face_mask)
-
-        # If we find a valid bounding box from the face-like area, we will update the image accordingly
-        if w > 0 and h > 0:
-            cv.rectangle(img_np, (x, y), (x + w, y + h), (255, 0, 0), 2)  # Blue bounding box around detected face
-            cv.putText(img_np, 'Face', (x, y - 10), cv.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 0), 2)
+            # If no landmarks, keep the original face box
+            else:
+                cv.putText(img_np, 'Face Detected', (x1, y1 - 10), cv.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 0), 2)
 
         # Return the highest match score and the processed image
         return highest_score, best_match, img_np
@@ -266,10 +269,14 @@ class PokemonPredictor:
         print(f"Unexpected error in process_frame: {e}")
 
      # Return the original values if an error occurs
-     return highest_score, best_match, img_np  
-    
-    
-    
+     return highest_score, best_match, img_np
+ 
+ 
+ 
+ 
+ 
+ 
+ 
     async def save_gif_with_detections(self, frames, durations):
      """Save the processed frames as a new GIF with bounding boxes, maintaining the original speed."""
      save_path = 'detected_pokemon.gif'
