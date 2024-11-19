@@ -12,6 +12,7 @@ from PIL import Image, ImageSequence
 from tqdm import tqdm  # Import tqdm for progress tracking
 import mediapipe as mp
 
+
 # Configure logging
 logging.basicConfig(filename='pokemon_predictor.log', level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
@@ -28,7 +29,26 @@ class PokemonPredictor:
         self.dataset_file = dataset_file
         self.dataset_folder = dataset_folder
         self.orb = cv.ORB_create(nfeatures=num_keypoints)  # Initialize ORB detector
-        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+        # Initialize cascades for face and body detection
+        self.head_cascade = cv.CascadeClassifier(cv.data.haarcascades + 'haarcascade_frontalface_default.xml')  # or use another head detection model
+        self.body_cascade = cv.CascadeClassifier(cv.data.haarcascades + 'haarcascade_fullbody.xml')  # Load a body detection model
+        self.face_cascade = cv.CascadeClassifier(cv.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        self.body_cascade = cv.CascadeClassifier(cv.data.haarcascades + 'haarcascade_fullbody.xml')
+        self.eye_cascade = cv.CascadeClassifier(cv.data.haarcascades + 'haarcascade_eye.xml')
+        self.orb = cv.ORB_create()  # ORB feature detector
+        self.cache = {}  # Store descriptors for similarity comparison
+        self.face = cv.CascadeClassifier(cv.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+        self.face_recognizer =  cv.face.LBPHFaceRecognizer_create()  # Optional: For learning faces
+        self.face_net = cv.dnn.readNetFromCaffe("hidden/deploy.prototxt", "hidden/res10_300x300_ssd_iter_140000.caffemodel")
+
+
+
+
+
+   
+
+      
 
     async def load_dataset(self):
         """Load the dataset from npy file or process the image folder asynchronously."""
@@ -184,80 +204,70 @@ class PokemonPredictor:
     
     
     async def process_frame(self, img_np, frame_idx, highest_score, best_match):
-     """Process a single frame/image for prediction with stronger edge detection and adaptive bounding."""
+     """Face detection with landmark refinement and tightly fitted bounding boxes for multiple faces."""
+     try:
+        # Convert image to blob for face detection
+        blob = cv.dnn.blobFromImage(img_np, 1.0, (300, 300), (104.0, 177.0, 123.0), swapRB=True, crop=False)
+        self.face_net.setInput(blob)
+        detections = self.face_net.forward()
 
-     # Apply Gaussian blur to reduce noise and enhance edges
-     blurred_img = cv.GaussianBlur(img_np, (5, 5), 0)
-    
-     # Apply adaptive thresholding for more consistent edge enhancement
-     gray_img = cv.cvtColor(blurred_img, cv.COLOR_BGR2GRAY)
-     adaptive_thresh = cv.adaptiveThreshold(gray_img, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                           cv.THRESH_BINARY_INV, 11, 2)
-    
-     # Apply Canny edge detection with fine-tuned thresholds
-     edged_img = cv.Canny(adaptive_thresh, 20, 120)
-    
-     # Dilate edges to connect broken lines and make contours more complete
-     dilated_img = cv.dilate(edged_img, None, iterations=2)
-    
-     # Find contours in the processed (dilated) edge image
-     contours, _ = cv.findContours(dilated_img, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+        # Iterate through all detections
+        for i in range(detections.shape[2]):
+            confidence = detections[0, 0, i, 2]
 
-     # Create a blank image for the heat map
-     heat_map = np.zeros_like(img_np, dtype=np.float32)
+            # Compute the bounding box of the detected face
+            x1 = int(detections[0, 0, i, 3] * img_np.shape[1])
+            y1 = int(detections[0, 0, i, 4] * img_np.shape[0])
+            x2 = int(detections[0, 0, i, 5] * img_np.shape[1])
+            y2 = int(detections[0, 0, i, 6] * img_np.shape[0])
 
-     if contours:
-        # Reduce the contour area threshold for increased sensitivity
-        large_contours = [cnt for cnt in contours if cv.contourArea(cnt) > 300]  # Reduced threshold
+            # Ensure bounding box is within the image boundaries
+            x1, y1, x2, y2 = max(0, x1), max(0, y1), min(img_np.shape[1], x2), min(img_np.shape[0], y2)
 
-        if large_contours:
-            # Sort contours by area and keep the top largest contours
-            large_contours = sorted(large_contours, key=cv.contourArea, reverse=True)[:5]
+            # Draw the initial face bounding box
+            cv.rectangle(img_np, (x1, y1), (x2, y2), (255, 0, 0), 2)
+            cv.putText(img_np, 'Face Detected', (x1, y1 - 10), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
 
-            for cnt in large_contours:
-                # Get bounding box and slightly expand it to ensure complete object capture
-                x, y, w, h = cv.boundingRect(cnt)
-                expansion_margin = 10  # Pixels to expand in each direction
-                x = max(0, x - expansion_margin)
-                y = max(0, y - expansion_margin)
-                w = min(img_np.shape[1] - x, w + 2 * expansion_margin)
-                h = min(img_np.shape[0] - y, h + 2 * expansion_margin)
-                
-                roi = img_np[y:y + h, x:x + w]
+            # Use landmarks to refine the bounding box
+            face_roi = img_np[y1:y2, x1:x2]
+            landmarks = self.landmark_detector.detectLandmarks(face_roi)
 
-                # Convert ROI to grayscale for feature detection
-                gray_roi = cv.cvtColor(roi, cv.COLOR_BGR2GRAY)
+            if landmarks:
+                # Calculate the refined bounding box based on landmarks
+                min_x = min([pt[0] for pt in landmarks])
+                max_x = max([pt[0] for pt in landmarks])
+                min_y = min([pt[1] for pt in landmarks])
+                max_y = max([pt[1] for pt in landmarks])
 
-                # Detect keypoints and compute descriptors
-                kp_roi, des_roi = self.orb.detectAndCompute(gray_roi, None)
-                if des_roi is not None and des_roi.shape[0] > 0:
-                    # Compare with dataset using cosine similarity
-                    for name, des in self.cache.items():
-                        if des.shape[0] > 0:
-                            similarity = cosine_similarity(des_roi.astype(np.float32), des.astype(np.float32))
-                            score = np.max(similarity)
+                # Apply a shrink factor to make the bounding box tighter around the face
+                shrink_factor = 0.1
+                x1_refined = max(0, int(x1 + min_x - (max_x - min_x) * shrink_factor))
+                y1_refined = max(0, int(y1 + min_y - (max_y - min_y) * shrink_factor))
+                x2_refined = min(img_np.shape[1], int(x1 + max_x + (max_x - min_x) * shrink_factor))
+                y2_refined = min(img_np.shape[0], int(y1 + max_y + (max_y - min_y) * shrink_factor))
 
-                            # Update best match if score is higher
-                            if score > highest_score:
-                                highest_score = score
-                                best_match = name
+                # Draw the refined bounding box
+                cv.rectangle(img_np, (x1_refined, y1_refined), (x2_refined, y2_refined), (0, 255, 0), 2)
+                cv.putText(img_np, 'Refined Face', (x1_refined, y1_refined - 10), cv.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+            else:
+                cv.putText(img_np, 'No Landmarks Detected', (x1, y1 - 10), cv.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 0), 2)
 
-                # Draw expanded bounding box
-                cv.rectangle(img_np, (x, y), (x + w, y + h), (255, 0, 0), 2)  # Red bounding box
+        # Return the highest match score, best match, and the processed image
+        return highest_score, best_match, img_np
 
-                # Update the heat map with the bounding box area
-                cv.rectangle(heat_map, (x, y), (x + w, y + h), (255, 255, 255), -1)  # White rectangle
+     except cv.error as e:
+        print(f"OpenCV error in process_frame: {e}")
+     except Exception as e:
+        print(f"Unexpected error in process_frame: {e}")
 
-        # Draw contours for visualization
-        for cnt in large_contours:
-            cv.drawContours(img_np, [cnt], -1, (0, 255, 0), 2)  # Green contour lines
-
-     # Return the highest score, best match, and processed image
+     # Return the original values in case of an error
      return highest_score, best_match, img_np
+ 
+ 
  
     async def save_gif_with_detections(self, frames, durations):
      """Save the processed frames as a new GIF with bounding boxes, maintaining the original speed."""
-     save_path = 'detected_pokemon.gif'
+     save_path = 'detected_face.gif'
      frames_to_save = [Image.fromarray(frame) for frame in frames]
     
      # Save the frames with the original frame durations
