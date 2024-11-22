@@ -204,63 +204,85 @@ class PokemonPredictor:
     
     
     async def process_frame(self, img_np, frame_idx, highest_score, best_match):
-     """Face detection with landmark refinement and tightly fitted bounding box."""
+     """
+     Enhanced adaptive face detection with landmark refinement, dynamic adjustments,
+     and stability mechanisms for better tracking across frames.
+     """
      try:
-        # Convert the image to BGR for face detection
-        blob = cv.dnn.blobFromImage(img_np, 1.0, (300, 300), (104.0, 177.0, 123.0), swapRB=True, crop=False)
+        # Analyze brightness to adjust preprocessing dynamically
+        brightness = cv.mean(cv.cvtColor(img_np, cv.COLOR_BGR2GRAY))[0]
+        adaptive_threshold = max(0.109, min(0.6, brightness / 255))  # Adjust confidence based on brightness
+
+        # Prepare the input blob for face detection
+        blob = cv.dnn.blobFromImage(
+            img_np, 1.0, (300, 300), (104.0, 177.0, 123.0), swapRB=True, crop=False
+        )
         self.face_net.setInput(blob)
         detections = self.face_net.forward()
 
-        # Find the highest scoring detection
-        face_box = None
-        max_confidence = 0
+        img_h, img_w = img_np.shape[:2]  # Image dimensions
 
-        # Iterate over all detections to find the best face
+        # Storage for stabilized bounding boxes
+        self.previous_boxes = getattr(self, 'previous_boxes', [])
+        self.stabilization_threshold = 5  # Frame stability threshold
+
         for i in range(detections.shape[2]):
             confidence = detections[0, 0, i, 2]
-            if confidence > max_confidence:
-                max_confidence = confidence
-                x1 = int(detections[0, 0, i, 3] * img_np.shape[1])
-                y1 = int(detections[0, 0, i, 4] * img_np.shape[0])
-                x2 = int(detections[0, 0, i, 5] * img_np.shape[1])
-                y2 = int(detections[0, 0, i, 6] * img_np.shape[0])
-                face_box = (x1, y1, x2, y2)
+            if confidence < 0:  # Skip weak detections
+                continue
 
-        # If a face was detected, process landmarks and refine the bounding box
-        if face_box:
-            # Draw the initial bounding box
-            x1, y1, x2, y2 = face_box
+            # Compute bounding box
+            x1 = max(0, int(detections[0, 0, i, 3] * img_w))
+            y1 = max(0, int(detections[0, 0, i, 4] * img_h))
+            x2 = min(img_w, int(detections[0, 0, i, 5] * img_w))
+            y2 = min(img_h, int(detections[0, 0, i, 6] * img_h))
+
+            # Stabilize bounding box using historical data
+            box = (x1, y1, x2, y2)
+            if self.previous_boxes:
+                # Smooth bounding box using weighted average
+                last_box = self.previous_boxes[-1]
+                box = tuple(
+                    int(last_box[j] * 0.7 + box[j] * 0.3) for j in range(4)
+                )
+            
+            self.previous_boxes.append(box)
+            if len(self.previous_boxes) > self.stabilization_threshold:
+                self.previous_boxes.pop(0)
+
+            x1, y1, x2, y2 = box
+
+            # Draw stabilized bounding box
             cv.rectangle(img_np, (x1, y1), (x2, y2), (255, 0, 0), 2)
-            cv.putText(img_np, 'Face', (x1, y1 - 10), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+            cv.putText(img_np, 'Face Detected', (x1, y1 - 10), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
 
-            # Use the landmark detector to refine the face area
+            # Extract ROI for landmarks
             face_roi = img_np[y1:y2, x1:x2]
             landmarks = self.landmark_detector.detectLandmarks(face_roi)
 
             if landmarks:
-                # Use the landmarks to refine the bounding box
-                # Assuming landmarks is a list of points like [(x1, y1), (x2, y2), ...]
-                min_x = min([pt[0] for pt in landmarks])
-                max_x = max([pt[0] for pt in landmarks])
-                min_y = min([pt[1] for pt in landmarks])
-                max_y = max([pt[1] for pt in landmarks])
+                # Adaptive refinement: shrink factor adjusts with face size
+                face_width, face_height = x2 - x1, y2 - y1
+                shrink_factor = max(0.05, min(0.2, 50 / min(face_width, face_height)))
 
-                # Adjust the bounding box to fit the landmarks more tightly
-                shrink_factor = 0.1  # Shrink the box slightly
-                x1 = max(0, int(min_x - (max_x - min_x) * shrink_factor))
-                y1 = max(0, int(min_y - (max_y - min_y) * shrink_factor))
-                x2 = min(img_np.shape[1], int(max_x + (max_x - min_x) * shrink_factor))
-                y2 = min(img_np.shape[0], int(max_y + (max_y - min_y) * shrink_factor))
+                # Calculate refined bounding box from landmarks
+                min_x = min(pt[0] for pt in landmarks)
+                max_x = max(pt[0] for pt in landmarks)
+                min_y = min(pt[1] for pt in landmarks)
+                max_y = max(pt[1] for pt in landmarks)
 
-                # Draw the refined bounding box
-                cv.rectangle(img_np, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv.putText(img_np, 'Refined Face', (x1, y1 - 10), cv.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+                x1_refined = max(0, int(x1 + min_x - (max_x - min_x) * shrink_factor))
+                y1_refined = max(0, int(y1 + min_y - (max_y - min_y) * shrink_factor))
+                x2_refined = min(img_w, int(x1 + max_x + (max_x - min_x) * shrink_factor))
+                y2_refined = min(img_h, int(y1 + max_y + (max_y - min_y) * shrink_factor))
 
-            # If no landmarks, keep the original face box
+                # Draw refined bounding box
+                cv.rectangle(img_np, (x1_refined, y1_refined), (x2_refined, y2_refined), (0, 255, 0), 2)
+                cv.putText(img_np, 'Refined Face', (x1_refined, y1_refined - 10), cv.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
             else:
-                cv.putText(img_np, 'Face Detected', (x1, y1 - 10), cv.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 0), 2)
+                cv.putText(img_np, 'No Landmarks Detected', (x1, y1 - 10), cv.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 0), 2)
 
-        # Return the highest match score and the processed image
+        # Return highest match and processed frame
         return highest_score, best_match, img_np
 
      except cv.error as e:
@@ -268,18 +290,12 @@ class PokemonPredictor:
      except Exception as e:
         print(f"Unexpected error in process_frame: {e}")
 
-     # Return the original values if an error occurs
+     # Return original values in case of error
      return highest_score, best_match, img_np
- 
- 
- 
- 
- 
- 
- 
+
     async def save_gif_with_detections(self, frames, durations):
      """Save the processed frames as a new GIF with bounding boxes, maintaining the original speed."""
-     save_path = 'detected_pokemon.gif'
+     save_path = 'detected_face.gif'
      frames_to_save = [Image.fromarray(frame) for frame in frames]
     
      # Save the frames with the original frame durations
