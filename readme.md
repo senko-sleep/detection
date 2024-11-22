@@ -1,28 +1,28 @@
 # Image Detection
 
-`Image Detection` is a Python-based application for detecting and highlighting key objects in images and animated GIFs. It utilizes advanced edge detection, feature matching, and asynchronous processing to efficiently handle various file types, drawing bounding boxes around detected regions.
+`Image Detection` is a Python-based app that detects and highlights key objects in images and GIFs. It uses edge detection, feature matching, and async processing to handle different file types, drawing boxes around detected areas.
 
 ![Detected GIF](Testing/images/detected.gif)
 
 ### Features:
-- **Async Loading**: Efficiently loads and caches image data with asynchronous processing.
-- **Edge Detection and Keypoints**: Uses ORB keypoints and FLANN-based matching for accurate feature detection.
-- **GIF Support**: Processes GIF frames with bounding boxes and saves results as a new animated GIF.
-- **URL Support**: Allows for loading images directly from URLs.
-- **Progress Tracking**: Uses `tqdm` to display processing progress for GIF frames.
+- **Async Loading**: Quickly loads and caches image data.
+- **Edge Detection**: Uses ORB keypoints and FLANN-based matching to find features.
+- **GIF Support**: Processes GIFs, adds boxes, and saves the results as new GIFs.
+- **URL Support**: Lets you load images from URLs.
+- **Progress Tracking**: Shows progress with `tqdm` while processing GIFs.
 
 ### Detected Face GIF
 
 ![Detected Face GIF](Testing/images/detected_face.gif)
 
-This GIF demonstrates the **face detection** functionality of the `ImagePredictor`. In the example, the application detects faces in animated GIFs frame by frame. Each frame is processed to identify the most prominent face using the `DNN-based face detector`. Once the face is detected, a bounding box is drawn around it to clearly highlight the identified region. 
+This GIF shows how the app highlights faces in GIFs. It detects faces in each frame using a DNN-based detector and draws a box around each face.
 
-**Key Steps:**
-- **Face Detection**: The system uses OpenCV's deep learning-based face detector (Caffe model) to identify faces.
-- **Landmark Refinement**: After detecting the face, the system refines the bounding box using facial landmarks to ensure a tight fit around the face.
-- **GIF Processing**: The process works for both static images and GIFs, where each frame is processed independently, and the final output is saved as a new GIF.
+**How It Works:**
+- **Face Detection**: Uses OpenCV's DNN-based face detector (Caffe model) to find faces.
+- **Box Refinement**: Adjusts boxes with facial landmarks for a better fit.
+- **GIF Processing**: Processes each frame and saves the result as a new GIF.
 
-The result is an animated GIF showing faces accurately detected and refined across multiple frames.
+The final result is a GIF with faces accurately highlighted frame by frame.
 
 ## Installation
 
@@ -31,4 +31,3 @@ The result is an animated GIF showing faces accurately detected and refined acro
    ```bash
    git clone https://github.com/cringe-neko-girl/detection.git
    cd Detection
-
