@@ -11,7 +11,8 @@ from concurrent.futures import ThreadPoolExecutor
 from PIL import Image, ImageSequence
 from tqdm import tqdm  # Import tqdm for progress tracking
 import mediapipe as mp
-
+import cmake
+import dlib
 
 # Configure logging
 logging.basicConfig(filename='pokemon_predictor.log', level=logging.INFO,
@@ -21,26 +22,47 @@ logging.basicConfig(filename='pokemon_predictor.log', level=logging.INFO,
 class PokemonPredictor:
     def __init__(self, dataset_folder="Data/pokemon/pokemon_images", 
                  dataset_file="dataset.npy", max_workers=4, num_keypoints=100):
+        # Initialize key parameters
+        self.dataset_file = dataset_file
+        self.dataset_folder = dataset_folder
+        self.max_workers = max_workers
+        self.num_keypoints = num_keypoints
+        
+        # Initialize FLANN-based matcher for feature comparison
         self.flann = cv.FlannBasedMatcher(
             dict(algorithm=6, table_number=9, key_size=9, multi_probe_level=1), 
             dict(checks=1, fast=True)
         )
-        self.cache = {}  # Store descriptors
-        self.dataset_file = dataset_file
-        self.dataset_folder = dataset_folder
-        self.orb = cv.ORB_create(nfeatures=num_keypoints)  # Initialize ORB detector
-        # Initialize cascades for face and body detection
-        self.head_cascade = cv.CascadeClassifier(cv.data.haarcascades + 'haarcascade_frontalface_default.xml')  # or use another head detection model
-        self.body_cascade = cv.CascadeClassifier(cv.data.haarcascades + 'haarcascade_fullbody.xml')  # Load a body detection model
-        self.face_cascade = cv.CascadeClassifier(cv.data.haarcascades + 'haarcascade_frontalface_default.xml')
-        self.body_cascade = cv.CascadeClassifier(cv.data.haarcascades + 'haarcascade_fullbody.xml')
-        self.eye_cascade = cv.CascadeClassifier(cv.data.haarcascades + 'haarcascade_eye.xml')
-        self.orb = cv.ORB_create()  # ORB feature detector
-        self.cache = {}  # Store descriptors for similarity comparison
+
+        # Cache for storing descriptors
+        self.cache = {}  
+
+        # Initialize ORB feature detector
+        self.orb = cv.ORB_create(nfeatures=num_keypoints)  
+
+        # Initialize face recognizer (for optional face learning)
+        self.face_recognizer = cv.face.LBPHFaceRecognizer_create()  
+
+        # Load pre-trained models for face and body detection
+        self.face_net = cv.dnn.readNetFromCaffe("hidden/deploy.prototxt", "hidden/res10_300x300_ssd_iter_140000.caffemodel")
+        self.landmark_detector = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
+        self.body_net = cv.dnn.readNetFromDarknet("hidden/yolov4.cfg", "hidden/yolov4.weights")
+        self.body_net.setPreferableBackend(cv.dnn.DNN_BACKEND_OPENCV)
+        self.body_net.setPreferableTarget(cv.dnn.DNN_TARGET_CPU)
+        # Load Haar Cascade Classifiers for face and body detection
+        self.head_cascade = cv.CascadeClassifier(cv.data.haarcascades + 'haarcascade_frontalface_default.xml')  # Face detection
+        self.body_cascade = cv.CascadeClassifier(cv.data.haarcascades + 'haarcascade_fullbody.xml')  # Full-body detection
+        self.eye_cascade = cv.CascadeClassifier(cv.data.haarcascades + 'haarcascade_eye.xml')  # Eye detection
+
+        # Initialize face detection (Haar Cascade)
         self.face = cv.CascadeClassifier(cv.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
-        self.face_recognizer =  cv.face.LBPHFaceRecognizer_create()  # Optional: For learning faces
-        self.face_net = cv.dnn.readNetFromCaffe("hidden/deploy.prototxt", "hidden/res10_300x300_ssd_iter_140000.caffemodel")
+        # Previous bounding box history for face tracking
+        self.previous_faces = []  # Store previous face detections (for smoothing)
+        self.previous_bodies = []  # Store previous body detections (for smoothing)
+        self.face_memory = []  # Memory for past N frames of face detections
+        self.body_memory = []  # Memory for past N frames of body detections
+        self.smoothing_window = 5  # Number of past frames to consider for smoothing
 
 
 
@@ -204,95 +226,115 @@ class PokemonPredictor:
     
     
     async def process_frame(self, img_np, frame_idx, highest_score, best_match):
-     """
-     Enhanced adaptive face detection with landmark refinement, dynamic adjustments,
-     and stability mechanisms for better tracking across frames.
-     """
-     try:
-        # Analyze brightness to adjust preprocessing dynamically
-        brightness = cv.mean(cv.cvtColor(img_np, cv.COLOR_BGR2GRAY))[0]
-        adaptive_threshold = max(0.109, min(0.6, brightness / 255))  # Adjust confidence based on brightness
+        try:
+            # Step 1: Analyze brightness to adjust preprocessing dynamically
+            brightness = cv.mean(cv.cvtColor(img_np, cv.COLOR_BGR2GRAY))[0]
+            adaptive_threshold = max(0.11, min(0.6, brightness / 255))
 
-        # Prepare the input blob for face detection
-        blob = cv.dnn.blobFromImage(
-            img_np, 1.0, (300, 300), (104.0, 177.0, 123.0), swapRB=True, crop=False
-        )
-        self.face_net.setInput(blob)
-        detections = self.face_net.forward()
+            # Step 2: Prepare input blobs for face and body detection
+            face_blob = cv.dnn.blobFromImage(
+                img_np, 1.0, (300, 300), (104.0, 177.0, 123.0), swapRB=True, crop=False
+            )
+            body_blob = cv.dnn.blobFromImage(
+                img_np, 1.0 / 255.0, (416, 416), (0, 0, 0), swapRB=True, crop=False
+            )
 
-        img_h, img_w = img_np.shape[:2]  # Image dimensions
+            # Step 3: Set input for networks and get detections
+            self.face_net.setInput(face_blob)
+            face_detections = self.face_net.forward()
 
-        # Storage for stabilized bounding boxes
-        self.previous_boxes = getattr(self, 'previous_boxes', [])
-        self.stabilization_threshold = 5  # Frame stability threshold
+            self.body_net.setInput(body_blob)
+            body_detections = self.body_net.forward()
 
-        for i in range(detections.shape[2]):
-            confidence = detections[0, 0, i, 2]
-            if confidence < 0:  # Skip weak detections
-                continue
+            img_h, img_w = img_np.shape[:2]  # Image dimensions
 
-            # Compute bounding box
-            x1 = max(0, int(detections[0, 0, i, 3] * img_w))
-            y1 = max(0, int(detections[0, 0, i, 4] * img_h))
-            x2 = min(img_w, int(detections[0, 0, i, 5] * img_w))
-            y2 = min(img_h, int(detections[0, 0, i, 6] * img_h))
+            # Step 4: Detect faces (draw bounding boxes on original image)
+            detected_faces = []
+            for i in range(face_detections.shape[2]):
+                confidence = face_detections[0, 0, i, 2]
+                if confidence >= 0.25:
+                    x1 = max(0, int(face_detections[0, 0, i, 3] * img_w))
+                    y1 = max(0, int(face_detections[0, 0, i, 4] * img_h))
+                    x2 = min(img_w, int(face_detections[0, 0, i, 5] * img_w))
+                    y2 = min(img_h, int(face_detections[0, 0, i, 6] * img_h))
+                    detected_faces.append((x1, y1, x2, y2))
 
-            # Stabilize bounding box using historical data
-            box = (x1, y1, x2, y2)
-            if self.previous_boxes:
-                # Smooth bounding box using weighted average
-                last_box = self.previous_boxes[-1]
-                box = tuple(
-                    int(last_box[j] * 0.7 + box[j] * 0.3) for j in range(4)
-                )
-            
-            self.previous_boxes.append(box)
-            if len(self.previous_boxes) > self.stabilization_threshold:
-                self.previous_boxes.pop(0)
+            # Step 5: Detect bodies (draw bounding boxes on original image)
+            detected_bodies = []
+            for detection in body_detections:
+                confidence = detection[4]
+                if confidence >= 0.25:
+                    center_x = int(detection[0] * img_w)
+                    center_y = int(detection[1] * img_h)
+                    width = int(detection[2] * img_w)
+                    height = int(detection[3] * img_h)
 
-            x1, y1, x2, y2 = box
+                    x1 = max(0, center_x - width // 2)
+                    y1 = max(0, center_y - height // 2)
+                    x2 = min(img_w, center_x + width // 2)
+                    y2 = min(img_h, center_y + height // 2)
 
-            # Draw stabilized bounding box
-            cv.rectangle(img_np, (x1, y1), (x2, y2), (255, 0, 0), 2)
-            cv.putText(img_np, 'Face Detected', (x1, y1 - 10), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+                    aspect_ratio = height / width
+                    if aspect_ratio >= 1.2:  # Exclude non-body objects
+                        detected_bodies.append((x1, y1, x2, y2))
 
-            # Extract ROI for landmarks
-            face_roi = img_np[y1:y2, x1:x2]
-            landmarks = self.landmark_detector.detectLandmarks(face_roi)
+            # Step 6: Apply Non-Maximum Suppression (NMS) to reduce overlapping body detections
+            nms_indices = cv.dnn.NMSBoxes(
+                [box for box in detected_bodies], [1] * len(detected_bodies), 0.50, 0.4
+            )
 
-            if landmarks:
-                # Adaptive refinement: shrink factor adjusts with face size
-                face_width, face_height = x2 - x1, y2 - y1
-                shrink_factor = max(0.05, min(0.2, 50 / min(face_width, face_height)))
+            # Step 7: Smooth bounding boxes and predict zones
+            smoothed_faces = self.smooth_detections(self.previous_faces, detected_faces)
+            smoothed_bodies = self.smooth_detections(self.previous_bodies, detected_bodies)
 
-                # Calculate refined bounding box from landmarks
-                min_x = min(pt[0] for pt in landmarks)
-                max_x = max(pt[0] for pt in landmarks)
-                min_y = min(pt[1] for pt in landmarks)
-                max_y = max(pt[1] for pt in landmarks)
+            # Step 8: Draw bounding boxes on faces and bodies (colored for both)
+            for (x1, y1, x2, y2) in smoothed_faces:
+                cv.rectangle(img_np, (x1, y1), (x2, y2), (0, 0, 0), 2)
+                cv.putText(img_np, 'Face', (x1, y1 - 10), cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
 
-                x1_refined = max(0, int(x1 + min_x - (max_x - min_x) * shrink_factor))
-                y1_refined = max(0, int(y1 + min_y - (max_y - min_y) * shrink_factor))
-                x2_refined = min(img_w, int(x1 + max_x + (max_x - min_x) * shrink_factor))
-                y2_refined = min(img_h, int(y1 + max_y + (max_y - min_y) * shrink_factor))
+            if len(nms_indices) > 0:
+                for i in nms_indices.flatten():
+                    (x1, y1, x2, y2) = smoothed_bodies[i]
+                    cv.rectangle(img_np, (x1, y1), (x2, y2), (0, 0, 255), 2)  # Red for bodies
+                    cv.putText(img_np, 'Body', (x1, y1 - 10), cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
-                # Draw refined bounding box
-                cv.rectangle(img_np, (x1_refined, y1_refined), (x2_refined, y2_refined), (0, 255, 0), 2)
-                cv.putText(img_np, 'Refined Face', (x1_refined, y1_refined - 10), cv.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-            else:
-                cv.putText(img_np, 'No Landmarks Detected', (x1, y1 - 10), cv.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 0), 2)
+            # Store the current detections for smoothing in the next frame
+            self.previous_faces = smoothed_faces
+            self.previous_bodies = smoothed_bodies
 
-        # Return highest match and processed frame
+            # Step 9: Return the highest match and processed frame
+            return highest_score, best_match, img_np
+
+        except cv.error as e:
+            print(f"OpenCV error in process_frame: {e}")
+        except Exception as e:
+            print(f"Unexpected error in process_frame: {e}")
+
+        # Return original values in case of error
         return highest_score, best_match, img_np
 
-     except cv.error as e:
-        print(f"OpenCV error in process_frame: {e}")
-     except Exception as e:
-        print(f"Unexpected error in process_frame: {e}")
+    def smooth_detections(self, previous_detections, current_detections, smoothing_factor=0.5):
+        """
+        Smooth bounding boxes based on previous detections and current detections
+        using a simple average method for each (x1, y1, x2, y2) bounding box.
+        """
+        smoothed_detections = []
 
-     # Return original values in case of error
-     return highest_score, best_match, img_np
+        if len(previous_detections) != len(current_detections):
+            # Handle the case where the number of previous and current detections doesn't match
+            # In such cases, just return the current detections (no smoothing)
+            smoothed_detections = current_detections
+        else:
+            for prev, curr in zip(previous_detections, current_detections):
+                x1 = int(smoothing_factor * prev[0] + (1 - smoothing_factor) * curr[0])
+                y1 = int(smoothing_factor * prev[1] + (1 - smoothing_factor) * curr[1])
+                x2 = int(smoothing_factor * prev[2] + (1 - smoothing_factor) * curr[2])
+                y2 = int(smoothing_factor * prev[3] + (1 - smoothing_factor) * curr[3])
+                smoothed_detections.append((x1, y1, x2, y2))
 
+        return smoothed_detections
+   
+   
     async def save_gif_with_detections(self, frames, durations):
      """Save the processed frames as a new GIF with bounding boxes, maintaining the original speed."""
      save_path = 'detected_face.gif'
