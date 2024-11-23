@@ -118,7 +118,7 @@ class VideoProcessor:
         detected_faces = []
         for i in range(face_detections.shape[2]):
             confidence = face_detections[0, 0, i, 2]
-            if confidence >= 0.1:  # Adjust confidence threshold for face detection
+            if confidence >= 0.25:  # Adjust confidence threshold for face detection
                 x1 = max(0, int(face_detections[0, 0, i, 3] * img_w))
                 y1 = max(0, int(face_detections[0, 0, i, 4] * img_h))
                 x2 = min(img_w, int(face_detections[0, 0, i, 5] * img_w))
