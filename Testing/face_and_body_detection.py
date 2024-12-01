@@ -11,7 +11,7 @@ import imageio
 import re
 from tqdm import tqdm
 
-class VideoProcessor:
+class Processor:
     def __init__(self, face_model, body_model):
         self.face_net = cv.dnn.readNetFromCaffe(face_model[0], face_model[1])
         self.body_net = cv.dnn.readNetFromDarknet(body_model[0], body_model[1])
@@ -410,8 +410,8 @@ def process_media(media_url):
         # Output filename, using .jpg extension for images
         output_filename = f"temp.{media_type if media_type != 'image' else 'jpg'}"
 
-        # Create an instance of VideoProcessor
-        video_processor = VideoProcessor(face_model=('hidden/deploy.prototxt', 'hidden/res10_300x300_ssd_iter_140000.caffemodel'),
+        # Create an instance of Processor
+        video_processor = Processor(face_model=('hidden/deploy.prototxt', 'hidden/res10_300x300_ssd_iter_140000.caffemodel'),
                                          body_model=('hidden/yolov4.cfg', 'hidden/yolov4.weights'))
 
         # Download the media
