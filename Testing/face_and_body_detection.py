@@ -6,97 +6,44 @@ import numpy as np
 from PIL import Image
 import requests
 from io import BytesIO
-import concurrent.futures
-import imageio
 import re
-from tqdm import tqdm
+import asyncio
+import logging
+
 
 class Processor:
     def __init__(self, face_model, body_model):
         self.face_net = cv.dnn.readNetFromCaffe(face_model[0], face_model[1])
         self.body_net = cv.dnn.readNetFromDarknet(body_model[0], body_model[1])
-
-        # Initialize smoothing storage
         self.previous_faces = []
         self.previous_bodies = []
-        self.face_trackers = []
 
+    async def download_media(self, media_url, output_filename):
+        """Download any media type (image, GIF, or video)."""
+        try:
+            response = await asyncio.to_thread(requests.get, media_url, stream=True)
+            if response.status_code == 200:
+                with open(output_filename, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                print(f"Media downloaded: {output_filename}")
+            else:
+                raise Exception(f"Failed to download media: {media_url} (HTTP {response.status_code})")
+        except Exception as e:
+            raise ValueError(f"Error downloading media: {e}")
 
-    def download_video(self, video_url, output_filename='temp_video.mp4'):
-        # Using yt-dlp to download the video
-        ydl_opts = {
-            'format': 'best',
-            'outtmpl': output_filename,  # Save as 'temp_video.mp4'
-            'quiet': True,
-            'noplaylist': True,
-            'merge_output_format': 'mp4',
-        }
+    async def process_gif(self, frames, durations):
+        """Process each frame of the GIF and return the processed frames."""
+        processed_frames = []
+        # Use tqdm to show a progress bar while iterating through frames
+        for frame in tqdm(frames, desc="Drawling on frames", unit="frame"):
+            processed_frame = await asyncio.to_thread(self.process_frame, frame)
+            processed_frames.append(processed_frame)
+        await self.save_gif_with_detections(processed_frames, durations)
+        return processed_frames, durations
 
-        with youtube_dl.YoutubeDL(ydl_opts) as ydl:
-            result = ydl.extract_info(video_url, download=True)
-        
-        # Check if the file has been downloaded and exists
-        if not os.path.exists(output_filename):
-            raise Exception("Video download failed.")
-        
-        # Open the video file with OpenCV
-        cap = cv.VideoCapture(output_filename)
-        return cap
-
-    def download_image(self, image_url, output_filename='temp_image.jpg'):
-        # Download the image from the URL
-        response = requests.get(image_url)
-        if response.status_code == 200:
-            img_data = response.content
-            with open(output_filename, 'wb') as f:
-                f.write(img_data)
-            img = cv.imread(output_filename)
-
-            # Check if the image is empty
-            if img is None:
-                raise Exception("Failed to read image from URL.")
-            return img
-        else:
-            raise Exception("Failed to download image.")
-   
-    def download_media(self, media_url, output_filename):
-     """Download any media type (image, GIF, or video)."""
-     response = requests.get(media_url, stream=True)
-     if response.status_code == 200:
-        with open(output_filename, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
-        print(f"Media downloaded: {output_filename}")
-     else:
-        raise Exception(f"Failed to download media: {media_url} (HTTP {response.status_code})")
-
-
-    def download_gif(self, gif_url, output_filename='temp_gif.gif'):
-     # Download the GIF from the URL
-     response = requests.get(gif_url)
-     if response.status_code == 200:
-        with open(output_filename, 'wb') as f:
-            f.write(response.content)
-
-        # Open GIF with Pillow to get frames and durations
-        gif = Image.open(output_filename)
-        frames = []
-        durations = []
-        while True:
-            frame = np.array(gif)  # Convert frame to numpy array
-            frames.append(frame)
-            durations.append(gif.info.get('duration', 100))  # Default to 100ms if duration is missing
-            try:
-                gif.seek(gif.tell() + 1)
-            except EOFError:
-                break
-
-        return frames, durations
-     else:
-        raise Exception("Failed to download GIF.")
-    
     def process_frame(self, img_np):
-     print(img_np)
+     #print(img_np)
      if img_np is None or img_np.size == 0:
         print("Error: Empty image passed to process_frame.")
         return img_np  # Return the original image if it's empty
@@ -131,7 +78,7 @@ class Processor:
         detected_faces = []
         for i in range(face_detections.shape[2]):
             confidence = face_detections[0, 0, i, 2]
-            if confidence >= 0.106:  # Adjust confidence threshold for face detection
+            if confidence >= 0.25:  # Adjust confidence threshold for face detection
                 x1 = max(0, int(face_detections[0, 0, i, 3] * img_w))
                 y1 = max(0, int(face_detections[0, 0, i, 4] * img_h))
                 x2 = min(img_w, int(face_detections[0, 0, i, 5] * img_w))
@@ -209,7 +156,8 @@ class Processor:
 
         # Analyze brightness for preprocessing
         brightness = cv.mean(cv.cvtColor(img_np, cv.COLOR_BGR2GRAY))[0]
-        adaptive_threshold = max(0.11, min(0.6, brightness / 255))
+        adaptive_threshold = max(0.109, min(0.6, brightness / 255))  # Adjust confidence based on brightness
+
 
         # Prepare input blobs for detection
         face_blob = cv.dnn.blobFromImage(
@@ -233,12 +181,18 @@ class Processor:
         detected_faces = []
         for i in range(face_detections.shape[2]):
             confidence = face_detections[0, 0, i, 2]
-            if confidence >= 0.25:
-                x1 = max(0, int(face_detections[0, 0, i, 3] * img_w))
-                y1 = max(0, int(face_detections[0, 0, i, 4] * img_h))
-                x2 = min(img_w, int(face_detections[0, 0, i, 5] * img_w))
-                y2 = min(img_h, int(face_detections[0, 0, i, 6] * img_h))
-                detected_faces.append((x1, y1, x2, y2))
+            if confidence < 0:  # Skip weak detections
+                continue
+
+            # Compute bounding box
+            x1 = max(0, int(face_detections[0, 0, i, 3] * img_w))
+            y1 = max(0, int(face_detections[0, 0, i, 4] * img_h))
+            x2 = min(img_w, int(face_detections[0, 0, i, 5] * img_w))
+            y2 = min(img_h, int(face_detections[0, 0, i, 6] * img_h))
+
+            # Draw initial bounding box
+            cv.rectangle(img_np, (x1, y1), (x2, y2), (255, 0, 0), 2)
+            cv.putText(img_np, 'Face Detected', (x1, y1 - 10), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
 
         # Detect bodies
         detected_bodies = []
@@ -273,7 +227,7 @@ class Processor:
             cv.putText(img_np, 'Body', (x1, y1 - 10), cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
         # Save the processed image
-        output_path = "detected.jpeg"
+        output_path = "output/detected.jpeg"
         cv.imwrite(output_path, img_np)
 
         # Display the saved image in a window
@@ -294,21 +248,6 @@ class Processor:
 
      return None
    
-   
-   
-   
-   
-   
-   
-   
-   
-   
-   
-   
-   
-   
-   
-   
     def smooth_detections(self, previous_detections, current_detections, smoothing_factor=0.5):
         smoothed_detections = []
         if len(previous_detections) != len(current_detections):
@@ -322,167 +261,124 @@ class Processor:
                 smoothed_detections.append((x1, y1, x2, y2))
         return smoothed_detections
 
-    def save_result(self, img_np, output_path, durations=None):
-     # Save processed image or video
-     if output_path.endswith('.jpg'):
-        cv.imwrite(output_path, img_np)
-     elif output_path.endswith('.gif'):
-        if durations is None:
-            raise ValueError("Durations must be provided for GIF output to match original speed.")
-        
-        # Convert frames to PIL images for saving without altering their colors
-        pil_frames = [Image.fromarray(img_np) for img_np in img_np]  # No color conversion here
-        
-        # Save the GIF with specified durations
-        pil_frames[0].save(
-            output_path,
-            save_all=True,
-            append_images=pil_frames[1:],
-            duration=durations,
-            loop=0
-        )
-     else:
-        raise ValueError(f"Unsupported output format: {output_path.split('.')[-1]}")
-
-
-def is_youtube_url(url):
-    return re.match(r'https?://(?:www\.)?(?:youtube|youtu|vimeo)\.(com|be)/.+', url) is not None
-
-def detect_media_type(url):
-    """Detect media type based on URL or response."""
-    # Check if URL is a YouTube or Vimeo link (video)
-    if is_youtube_url(url):
-        return 'video'
-
-    # Try to get the file type from URL extension
-    file_extension = os.path.splitext(url)[1].lower()
-
-    if file_extension:
-        # Check if file extension is supported for image or gif
-        if file_extension in ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']:
-            return 'image'
-        elif file_extension in ['.gif']:
-            return 'gif'
+    async def save_gif_with_detections(self, frames, durations):
+     """Save the processed frames back into a GIF with detection boxes."""
+     processed_frames = []
     
-    # If no file extension, check the content type from HTTP headers
-    try:
-        response = requests.head(url, allow_redirects=True)
-        content_type = response.headers.get('Content-Type', '').lower()
+     # Use tqdm to show a progress bar while iterating through frames
+     for frame in tqdm(frames, desc="Saving frames", unit="frame"):
+        # Convert the frame from a NumPy array to a PIL Image
+        pil_frame = Image.fromarray(frame)
 
-        if 'image' in content_type:
+        # Optionally, save each processed frame or add to a list
+        processed_frames.append(pil_frame)
+
+     # Save the processed GIF
+     output_gif = "output/processed_media.gif"
+     processed_frames[0].save(output_gif, save_all=True, append_images=processed_frames[1:], loop=0, duration=durations)
+
+     print(f"Processed GIF saved as {output_gif}")
+     return output_gif
+    async def process_media(self, media_url):
+        """Main function to detect and process media from a URL."""
+        try:
+            # Detect the media type (image, gif, video)
+            media_type = await asyncio.to_thread(self.detect_media_type, media_url)
+            print(f"Detected media type: {media_type}")
+
+            # Output filename, using .jpg extension for images
+            output_filename = f"temp.{media_type if media_type != 'image' else 'jpg'}"
+
+            # Create an instance of Processor (ensure this is correctly set up)
+            processor = Processor(
+                face_model=('hidden/deploy.prototxt', 'hidden/res10_300x300_ssd_iter_140000.caffemodel'),
+                body_model=('hidden/yolov4.cfg', 'hidden/yolov4.weights')
+            )
+
+            # Download the media
+            await processor.download_media(media_url, output_filename)
+
+            if media_type == 'image':
+                # Process the image using OpenCV or PIL to ensure it's correctly loaded
+                img = await asyncio.to_thread(processor.process_frame, output_filename)
+                #print(f"Image type after processing: {type(img)}")
+
+                if isinstance(img, str):
+                    raise ValueError("Image processing returned a string instead of a NumPy array.")
+                if img is None:
+                    raise Exception("Image processing failed.")
+
+                img_np = np.array(img) if not isinstance(img, np.ndarray) else img
+                #print(f"Image data as NumPy array: {img_np.shape}")
+
+                return img_np
+
+            elif media_type == 'gif':
+                # Handle GIF-specific logic
+                print("Processing GIF...")
+                gif = Image.open(output_filename)
+                frames = []
+                durations = []  # To store the durations of each frame
+
+                # Use tqdm to show a progress bar while iterating through frames
+                for frame in tqdm(range(gif.n_frames), desc="Processing frames", unit="frame"):
+                    gif.seek(frame)
+                    frame_image = np.array(gif.convert('RGB'))  # Convert to RGB for further processing
+                    frames.append(frame_image)
+                    durations.append(gif.info['duration'])
+
+                processed_frames, durations = await processor.process_gif(frames, durations)
+                return processed_frames, durations
+
+            elif media_type == 'video':
+                # Handle video-specific logic
+                print("Processing video...")
+                # Implement the video processing logic here as per your requirements
+                pass
+
+        except Exception as e:
+            print(f"Error processing media: {e}")
+
+    def detect_media_type(self, media_url):
+        """Detects the media type from the URL or file extension."""
+        if media_url.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.tiff')):
             return 'image'
-        elif 'gif' in content_type:
+        elif media_url.lower().endswith('.gif'):
             return 'gif'
-        elif 'video' in content_type:
+        elif media_url.lower().endswith(('.mp4', '.mov', '.avi', '.mkv')):
             return 'video'
         else:
-            raise ValueError("Unsupported media type based on URL or content.")
-    except Exception as e:
-        raise ValueError(f"Error determining media type: {e}")
+            raise ValueError("Unsupported media type")
 
-# Example usage
-def main():
+def detect_media_type(media_url):
+    """Detect the type of media (image, gif, or video) based on the file extension."""
+    # List of supported image, gif, and video extensions
+    image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']
+    gif_extensions = ['.gif']
+    video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.webm']
+
+    # Get the file extension from the URL
+    file_extension = os.path.splitext(media_url)[-1].lower()
+
+    if file_extension in image_extensions:
+        return 'image'
+    elif file_extension in gif_extensions:
+        return 'gif'
+    elif file_extension in video_extensions:
+        return 'video'
+    else:
+        raise ValueError(f"Unsupported media type: {file_extension}")
+    
+async def main():
     while True:
-        media_url = input("Enter the media URL: ").strip()
+     media_url = input("Enter the media URL ('exit' to quit): ")
+     if media_url != 'exit':
+      processor = Processor(face_model=('hidden/deploy.prototxt', 'hidden/res10_300x300_ssd_iter_140000.caffemodel'), body_model=('hidden/yolov4.cfg', 'hidden/yolov4.weights'))
+      result = await processor.process_media(media_url)
+     else:
+         break
+     # print("Processed Media Result:", result)
 
-        if not media_url:
-            print("Invalid input. Exiting.")
-            return
-
-        try:
-            media_type = detect_media_type(media_url)
-            print(f"Detected media type: {media_type}")
-        except Exception as e:
-            print(f"Error: {e}")
-
-
-
-
-
-
-def process_media(media_url):
-    """Main function to detect and process media from a URL."""
-    try:
-        # Detect the media type (image, gif, video)
-        media_type = detect_media_type(media_url)
-        print(f"Detected media type: {media_type}")
-
-        # Output filename, using .jpg extension for images
-        output_filename = f"temp.{media_type if media_type != 'image' else 'jpg'}"
-
-        # Create an instance of Processor
-        video_processor = Processor(face_model=('hidden/deploy.prototxt', 'hidden/res10_300x300_ssd_iter_140000.caffemodel'),
-                                         body_model=('hidden/yolov4.cfg', 'hidden/yolov4.weights'))
-
-        # Download the media
-        video_processor.download_media(media_url, output_filename)
-
-        if media_type == 'image':
-            # Process the image using OpenCV or PIL to ensure it's correctly loaded
-            img = video_processor.process_image(output_filename)
-            print(f"Image type after processing: {type(img)}")  # Debugging line
-
-            # Check if img is a string (indicating an error), or None (processing failure)
-            if isinstance(img, str):
-                raise ValueError("Image processing returned a string instead of a NumPy array.")
-            if img is None:
-                raise Exception("Image processing failed.")
-
-            # Ensure img is a NumPy array (in case it's an image file path, for example)
-            img_np = np.array(img) if not isinstance(img, np.ndarray) else img
-            print(f"Image data as NumPy array: {img_np.shape}")  # Debugging line
-            
-            return img_np
-
-        elif media_type == 'gif':
-            # Handle GIF-specific logic
-            print("Processing GIF...")
-            gif = Image.open(output_filename)
-            frames = []
-            for frame in range(gif.n_frames):
-                gif.seek(frame)
-                frames.append(np.array(gif.convert('RGB')))  # Convert each frame to NumPy array
-            return frames
-
-        elif media_type == 'video':
-            # Handle video-specific logic (frame-by-frame processing)
-            print("Processing video...")
-            cap = cv.VideoCapture(output_filename)
-            if not cap.isOpened():
-                raise Exception("Failed to open video.")
-
-            frames = []
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                # Process each frame (here, just appending to a list)
-                frames.append(frame)
-            
-            cap.release()  # Release video capture after processing
-            return frames
-
-    except Exception as e:
-        print(f"Error processing media: {e}")
-        return None
-
-
-
-
-
-
-
-
-# Example usage
-def main():
-    while True:
-     media_url = input("Enter the media URL: ").strip()
-
-     if not media_url:
-        print("Invalid input. Exiting.")
-        return
-
-     process_media(media_url)
- 
-if __name__ == "__main__":
-    main()
+# Execute main asynchronously
+if __name__ == '__main__':
+    asyncio.run(main())
