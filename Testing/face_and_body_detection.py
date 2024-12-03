@@ -140,26 +140,22 @@ class Processor:
      return img_np
     
     def process_image(self, image_path):
-     """
-     Process an image, perform face and body detection, and save the result as 'detected.jpeg'.
-     """
-     try:
-        # Load the image from the provided path
-        img_np = cv.imread(image_path)
-        if img_np is None or img_np.size == 0:
-            print("Error: Failed to load image or empty image passed.")
-            return None  # Return None to indicate failure
+     # Load the image from the provided path
+     img_np = cv.imread(image_path)
+     if img_np is None or img_np.size == 0:
+        print("Error: Empty image passed to process_frame.")
+        return img_np  # Return the original image if it's empty
 
-        # Ensure the image has 3 channels (convert grayscale to RGB if necessary)
-        if len(img_np.shape) == 2:
+     try:
+        # Ensure the image has 3 channels (RGB)
+        if len(img_np.shape) == 2:  # Grayscale image
             img_np = cv.cvtColor(img_np, cv.COLOR_GRAY2BGR)
 
-        # Analyze brightness for preprocessing
+        # Step 1: Analyze brightness to adjust preprocessing dynamically
         brightness = cv.mean(cv.cvtColor(img_np, cv.COLOR_BGR2GRAY))[0]
-        adaptive_threshold = max(0.109, min(0.6, brightness / 255))  # Adjust confidence based on brightness
+        adaptive_threshold = max(0.11, min(0.6, brightness / 255))
 
-
-        # Prepare input blobs for detection
+        # Step 2: Prepare input blobs for face and body detection
         face_blob = cv.dnn.blobFromImage(
             img_np, 1.0, (300, 300), (104.0, 177.0, 123.0), swapRB=True, crop=False
         )
@@ -167,38 +163,31 @@ class Processor:
             img_np, 1.0 / 255.0, (416, 416), (0, 0, 0), swapRB=True, crop=False
         )
 
-        # Run face detection
+        # Step 3: Set input for networks and get detections
         self.face_net.setInput(face_blob)
         face_detections = self.face_net.forward()
 
-        # Run body detection
         self.body_net.setInput(body_blob)
         body_detections = self.body_net.forward()
 
-        img_h, img_w = img_np.shape[:2]
+        img_h, img_w = img_np.shape[:2]  # Image dimensions
 
-        # Detect faces
+        # Step 4: Detect faces (draw bounding boxes on original image)
         detected_faces = []
         for i in range(face_detections.shape[2]):
             confidence = face_detections[0, 0, i, 2]
-            if confidence < 0:  # Skip weak detections
-                continue
+            if confidence >= 0.25:  # Adjust confidence threshold for face detection
+                x1 = max(0, int(face_detections[0, 0, i, 3] * img_w))
+                y1 = max(0, int(face_detections[0, 0, i, 4] * img_h))
+                x2 = min(img_w, int(face_detections[0, 0, i, 5] * img_w))
+                y2 = min(img_h, int(face_detections[0, 0, i, 6] * img_h))
+                detected_faces.append((x1, y1, x2, y2))
 
-            # Compute bounding box
-            x1 = max(0, int(face_detections[0, 0, i, 3] * img_w))
-            y1 = max(0, int(face_detections[0, 0, i, 4] * img_h))
-            x2 = min(img_w, int(face_detections[0, 0, i, 5] * img_w))
-            y2 = min(img_h, int(face_detections[0, 0, i, 6] * img_h))
-
-            # Draw initial bounding box
-            cv.rectangle(img_np, (x1, y1), (x2, y2), (255, 0, 0), 2)
-            cv.putText(img_np, 'Face Detected', (x1, y1 - 10), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
-
-        # Detect bodies
+        # Step 5: Detect bodies (draw bounding boxes on original image)
         detected_bodies = []
         for detection in body_detections:
             confidence = detection[4]
-            if confidence >= 0.3:
+            if confidence >= 0.3:  # Adjust confidence threshold for body detection
                 center_x = int(detection[0] * img_w)
                 center_y = int(detection[1] * img_h)
                 width = int(detection[2] * img_w)
@@ -210,44 +199,53 @@ class Processor:
                 y2 = min(img_h, center_y + height // 2)
 
                 aspect_ratio = height / width
-                if aspect_ratio >= 1.2:
+                if aspect_ratio >= 1.2:  # Exclude non-body objects
                     detected_bodies.append((x1, y1, x2, y2))
 
-        # Smooth detections
+        # Step 6: Apply Non-Maximum Suppression (NMS) to reduce overlapping body detections
+        nms_indices = cv.dnn.NMSBoxes(
+            [box for box in detected_bodies], [1] * len(detected_bodies), 0.50, 0.4
+        )
+
+        # Step 7: Smooth bounding boxes and predict zones
         smoothed_faces = self.smooth_detections(self.previous_faces, detected_faces)
         smoothed_bodies = self.smooth_detections(self.previous_bodies, detected_bodies)
 
-        # Draw bounding boxes
+        # Step 8: Draw bounding boxes on faces and bodies (colored for both)
         for (x1, y1, x2, y2) in smoothed_faces:
-            cv.rectangle(img_np, (x1, y1), (x2, y2), (200, 0, 0), 2)
+            cv.rectangle(img_np, (x1, y1), (x2, y2), (200, 0, 0), 2)  # Red for faces
             cv.putText(img_np, 'Face', (x1, y1 - 10), cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
 
-        for (x1, y1, x2, y2) in smoothed_bodies:
-            cv.rectangle(img_np, (x1, y1), (x2, y2), (0, 0, 255), 2)
-            cv.putText(img_np, 'Body', (x1, y1 - 10), cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+        if len(nms_indices) > 0:
+            for i in nms_indices.flatten():
+                (x1, y1, x2, y2) = smoothed_bodies[i]
+                cv.rectangle(img_np, (x1, y1), (x2, y2), (0, 0, 255), 2)  # Red for bodies
+                cv.putText(img_np, 'Body', (x1, y1 - 10), cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
-        # Save the processed image
-        output_path = "output/detected.jpeg"
-        cv.imwrite(output_path, img_np)
-
-        # Display the saved image in a window
-        cv.imshow("Detected Image", img_np)
-        cv.waitKey(0)  # Wait for a key press to close the window
-        cv.destroyAllWindows()  # Close the window after the key press
-
-        # Store detections for smoothing in the next frame
+        # Store the current detections for smoothing in the next frame
         self.previous_faces = smoothed_faces
         self.previous_bodies = smoothed_bodies
 
+        # Show the processed image in a window
+        cv.imshow("Processed Image", img_np)
+
+        # Save the processed image as output/processed_media.png
+        cv.imwrite("output/processed_media.png", img_np)
+
+        # Wait for the user to press any key to close the window
+        cv.waitKey(0)
+        cv.destroyAllWindows()
+
+        # Return the processed image
         return img_np
 
      except cv.error as e:
-        print(f"OpenCV error in process_image: {e}")
+        print(f"OpenCV error in process_frame: {e}")
      except Exception as e:
-        print(f"Unexpected error in process_image: {e}")
+        print(f"Unexpected error in process_frame: {e}")
 
-     return None
-   
+     # Return the original frame in case of error
+     return img_np
     def smooth_detections(self, previous_detections, current_detections, smoothing_factor=0.5):
         smoothed_detections = []
         if len(previous_detections) != len(current_detections):
@@ -300,7 +298,7 @@ class Processor:
 
             if media_type == 'image':
                 # Process the image using OpenCV or PIL to ensure it's correctly loaded
-                img = await asyncio.to_thread(processor.process_frame, output_filename)
+                img = await asyncio.to_thread(processor.process_image, output_filename)
                 #print(f"Image type after processing: {type(img)}")
 
                 if isinstance(img, str):
