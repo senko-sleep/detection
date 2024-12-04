@@ -13,7 +13,7 @@
 
 ### Detected Face GIF
 
-![Detected Face GIF](Testing/images/detected_face.gif)
+![Detected Face GIF](Testing/images/processed_media.gif)
 
 This GIF shows how the app highlights faces in GIFs. It detects faces in each frame using a DNN-based detector and draws a box around each face.
 
