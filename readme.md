@@ -11,7 +11,7 @@
 - **URL Support**: Lets you load images from URLs.
 - **Progress Tracking**: Shows progress with `tqdm` while processing GIFs.
 
-### Detected Face GIF
+### Detected Body and Face GIF
 
 ![Detected Body and Face GIF](Testing/images/processed_media.gif)
 
