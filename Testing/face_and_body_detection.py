@@ -17,6 +17,11 @@ class Processor:
         self.body_net = cv.dnn.readNetFromDarknet(body_model[0], body_model[1])
         self.previous_faces = []
         self.previous_bodies = []
+        # Load Haar Cascade Classifiers for face, body, eyes, and head
+        self.face_cascade = cv.CascadeClassifier(cv.data.haarcascades + 'haarcascade_frontalface_default.xml')  # Face detection
+        self.body_cascade = cv.CascadeClassifier(cv.data.haarcascades + 'haarcascade_fullbody.xml')  # Body detection
+        self.eye_cascade = cv.CascadeClassifier(cv.data.haarcascades + 'haarcascade_eye.xml')  # Eye detection
+        self.head_cascade = cv.CascadeClassifier(cv.data.haarcascades + 'haarcascade_frontalface_default.xml')  # Head detection (same as face)
 
     async def download_media(self, media_url, output_filename):
         """Download any media type (image, GIF, or video)."""
@@ -43,7 +48,6 @@ class Processor:
         return processed_frames, durations
 
     def process_frame(self, img_np):
-     #print(img_np)
      if img_np is None or img_np.size == 0:
         print("Error: Empty image passed to process_frame.")
         return img_np  # Return the original image if it's empty
@@ -57,7 +61,7 @@ class Processor:
         brightness = cv.mean(cv.cvtColor(img_np, cv.COLOR_BGR2GRAY))[0]
         adaptive_threshold = max(0.11, min(0.6, brightness / 255))
 
-        # Step 2: Prepare input blobs for face and body detection
+        # Step 2: Prepare input blobs for face and body detection using DNN models
         face_blob = cv.dnn.blobFromImage(
             img_np, 1.0, (300, 300), (104.0, 177.0, 123.0), swapRB=True, crop=False
         )
@@ -74,22 +78,31 @@ class Processor:
 
         img_h, img_w = img_np.shape[:2]  # Image dimensions
 
-        # Step 4: Detect faces (draw bounding boxes on original image)
+        # Step 4: Detect faces (take highest confidence detection)
         detected_faces = []
+        max_confidence_face = -1
+        max_face_coords = None
         for i in range(face_detections.shape[2]):
             confidence = face_detections[0, 0, i, 2]
-            if confidence >= 0.25:  # Adjust confidence threshold for face detection
-                x1 = max(0, int(face_detections[0, 0, i, 3] * img_w))
-                y1 = max(0, int(face_detections[0, 0, i, 4] * img_h))
-                x2 = min(img_w, int(face_detections[0, 0, i, 5] * img_w))
-                y2 = min(img_h, int(face_detections[0, 0, i, 6] * img_h))
-                detected_faces.append((x1, y1, x2, y2))
+            if confidence > max_confidence_face:  # Track the highest confidence
+                max_confidence_face = confidence
+                x1 = int(face_detections[0, 0, i, 3] * img_w)
+                y1 = int(face_detections[0, 0, i, 4] * img_h)
+                x2 = int(face_detections[0, 0, i, 5] * img_w)
+                y2 = int(face_detections[0, 0, i, 6] * img_h)
+                max_face_coords = (x1, y1, x2, y2)
 
-        # Step 5: Detect bodies (draw bounding boxes on original image)
+        if max_face_coords:
+            detected_faces.append(max_face_coords)  # Add the highest confidence face
+
+        # Step 5: Detect bodies (take highest confidence detection)
         detected_bodies = []
+        max_confidence_body = -1
+        max_body_coords = None
         for detection in body_detections:
             confidence = detection[4]
-            if confidence >= 0.3:  # Adjust confidence threshold for body detection
+            if confidence > max_confidence_body:  # Track the highest confidence
+                max_confidence_body = confidence
                 center_x = int(detection[0] * img_w)
                 center_y = int(detection[1] * img_h)
                 width = int(detection[2] * img_w)
@@ -102,14 +115,17 @@ class Processor:
 
                 aspect_ratio = height / width
                 if aspect_ratio >= 1.2:  # Exclude non-body objects
-                    detected_bodies.append((x1, y1, x2, y2))
+                    max_body_coords = (x1, y1, x2, y2)
+
+        if max_body_coords:
+            detected_bodies.append(max_body_coords)  # Add the highest confidence body
 
         # Step 6: Apply Non-Maximum Suppression (NMS) to reduce overlapping body detections
         nms_indices = cv.dnn.NMSBoxes(
             [box for box in detected_bodies], [1] * len(detected_bodies), 0.50, 0.4
         )
 
-        # Step 7: Smooth bounding boxes and predict zones
+        # Step 7: Smooth bounding boxes and predict zones (if needed)
         smoothed_faces = self.smooth_detections(self.previous_faces, detected_faces)
         smoothed_bodies = self.smooth_detections(self.previous_bodies, detected_bodies)
 
@@ -138,7 +154,7 @@ class Processor:
 
      # Return the original frame in case of error
      return img_np
-    
+ 
     def process_image(self, image_path):
      # Load the image from the provided path
      img_np = cv.imread(image_path)
@@ -370,7 +386,7 @@ def detect_media_type(media_url):
 async def main():
     while True:
      media_url = input("Enter the media URL ('exit' to quit): ")
-     if media_url != 'exit':
+     if media_url not in ['exit', 'quit','stop','end']:
       processor = Processor(face_model=('hidden/deploy.prototxt', 'hidden/res10_300x300_ssd_iter_140000.caffemodel'), body_model=('hidden/yolov4.cfg', 'hidden/yolov4.weights'))
       result = await processor.process_media(media_url)
      else:
