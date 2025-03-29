@@ -26,10 +26,3 @@ This GIF shows how the app highlights faces in GIFs. It detects faces in each fr
 
 The final result is a GIF with faces accurately highlighted frame by frame.
 
-## Installation
-
-1. Clone the repository:
-
-   ```bash
-   git clone https://github.com/cringe-neko-girl/detection.git
-   cd Detection
